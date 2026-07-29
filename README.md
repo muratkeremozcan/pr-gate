@@ -6,6 +6,20 @@ failures.
 
 Always pin the action to a full commit SHA.
 
+## Installation
+
+Install watch mode in two phases. GitHub only delivers `workflow_run` events to
+a workflow that already exists on the default branch.
+
+1. Add the workflow below and merge it while `gate` is not yet required.
+2. After the workflow reaches the default branch, configure the branch ruleset
+   to require only `gate`.
+
+Repositories migrating an existing required `gate` need a one-time bootstrap.
+After the sibling jobs finish, rerun the PR Gate workflow or use a ruleset
+bypass to merge the installation PR. Routine pull requests need no manual
+rerun after installation.
+
 ## Watch mode
 
 Watch mode is event-driven. It publishes a check run named `gate` whenever a
