@@ -605,14 +605,23 @@ function externalIdFor(checkName) {
  */
 async function findOwnedCheckRun(ctx, name) {
   const externalId = externalIdFor(name);
+  // filter=all, not the default latest. `latest` is scoped to the newest check
+  // suite, so rerunning any workflow can hide the check run this action already
+  // owns; the lookup then finds nothing and creates a second one of the same
+  // required name, which is exactly what owning it is supposed to prevent.
   const found = await rest(
     ctx,
     'GET',
     `/repos/${ctx.owner}/${ctx.repo}/commits/${encodeURIComponent(ctx.sha)}/check-runs` +
-      `?check_name=${encodeURIComponent(name)}&filter=latest&per_page=100`
+      `?check_name=${encodeURIComponent(name)}&filter=all&per_page=100`
   );
   const sameName = (found?.check_runs || []).filter(Boolean);
-  const owned = sameName.find((run) => run.external_id === externalId);
+  // Newest first, because commits gated before this fix can already carry
+  // duplicates and GitHub takes the most recently updated one as the status
+  // context. Writing to any other would leave the required check on a stale value.
+  const owned = sameName
+    .filter((run) => run.external_id === externalId)
+    .sort((a, b) => String(b.started_at || '').localeCompare(String(a.started_at || '')) || (b.id || 0) - (a.id || 0))[0];
   if (owned) return owned;
 
   if (sameName.length > 0) {

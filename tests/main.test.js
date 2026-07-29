@@ -810,7 +810,7 @@ describe('upsertCheckRun', () => {
     const get = calls.find((c) => c.method === 'GET');
     assert.match(get.url, /\/commits\/deadbeef\/check-runs/);
     assert.match(get.url, /check_name=my%20gate/);
-    assert.match(get.url, /filter=latest/);
+    assert.match(get.url, /filter=all/);
   });
 
   test('REST writes inherit the retry rules, so a 502 does not lose the verdict', async () => {
@@ -957,15 +957,44 @@ describe('findOwnedCheckRun', () => {
   });
 
   const ctx = { apiUrl: 'https://api.github.invalid', token: 't', owner: 'o', repo: 'r', sha: 'deadbeef', retryLimit: 3, baseDelayMs: 0 };
+  const urls = [];
   const lookup = (check_runs) => {
-    global.fetch = async () => ({
-      ok: true,
-      status: 200,
-      headers: new Headers(),
-      json: async () => ({ check_runs }),
-      text: async () => '',
-    });
+    urls.length = 0;
+    global.fetch = async (url) => {
+      urls.push(url);
+      return {
+        ok: true,
+        status: 200,
+        headers: new Headers(),
+        json: async () => ({ check_runs }),
+        text: async () => '',
+      };
+    };
   };
+
+  test('asks for every check run, not just the latest', async () => {
+    // filter=latest is scoped to the newest check suite, so once any workflow is
+    // rerun the gate this action already owns can vanish from the response. The
+    // lookup then reports nothing found and a second check run of the same
+    // required name gets created, which is the one thing owning it must prevent.
+    // Seen on couture-cast PR #95 when a workflow was rerun by hand.
+    lookup([]);
+    await gate.findOwnedCheckRun(ctx, 'gate');
+    assert.match(urls[0], /[?&]filter=all(&|$)/);
+    assert.doesNotMatch(urls[0], /filter=latest/);
+  });
+
+  test('picks the newest of several it owns, so the stale duplicate is left alone', async () => {
+    // Duplicates already exist on commits gated before the fix. GitHub treats the
+    // most recently updated check run of a name as the status context, so writing
+    // to the newest is what keeps the required check consistent.
+    lookup([
+      { id: 10, external_id: gate.externalIdFor('gate'), started_at: '2026-07-29T10:00:00Z' },
+      { id: 11, external_id: gate.externalIdFor('gate'), started_at: '2026-07-29T12:00:00Z' },
+      { id: 9, external_id: gate.externalIdFor('gate'), started_at: '2026-07-29T09:00:00Z' },
+    ]);
+    assert.strictEqual((await gate.findOwnedCheckRun(ctx, 'gate')).id, 11);
+  });
 
   test('null on the first event for a commit', async () => {
     lookup([]);
