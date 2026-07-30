@@ -607,6 +607,101 @@ describe('resolveSha', () => {
   });
 });
 
+describe('resolveHeadBranch', () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+
+  const payloadEnv = (payload, env = {}) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-'));
+    const file = path.join(dir, 'event.json');
+    fs.writeFileSync(file, JSON.stringify(payload));
+    return { GITHUB_EVENT_PATH: file, ...env };
+  };
+
+  test('on pull_request it reads the head ref from the payload', () => {
+    assert.strictEqual(
+      gate.resolveHeadBranch(payloadEnv({ pull_request: { head: { ref: 'hotfix/db-pool' } } })),
+      'hotfix/db-pool'
+    );
+  });
+
+  test('on workflow_run it reads head_branch, never GITHUB_REF_NAME', () => {
+    // This is the whole reason the branch is resolved in here. On workflow_run
+    // GITHUB_REF_NAME is the default branch and GITHUB_HEAD_REF is empty, so a
+    // caller-side startsWith(github.head_ref, 'hotfix/') reads false on every
+    // event after the seed, and the bypass silently stops working.
+    const env = payloadEnv(
+      { workflow_run: { head_branch: 'hotfix/db-pool' } },
+      { GITHUB_REF_NAME: 'master', GITHUB_HEAD_REF: '' }
+    );
+    assert.strictEqual(gate.resolveHeadBranch(env), 'hotfix/db-pool');
+  });
+
+  test('falls back to GITHUB_HEAD_REF, then GITHUB_REF_NAME', () => {
+    assert.strictEqual(gate.resolveHeadBranch({ GITHUB_HEAD_REF: 'feat/x', GITHUB_REF_NAME: 'master' }), 'feat/x');
+    assert.strictEqual(gate.resolveHeadBranch({ GITHUB_REF_NAME: 'master' }), 'master');
+  });
+
+  test('a malformed payload falls back instead of throwing', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-'));
+    const file = path.join(dir, 'event.json');
+    fs.writeFileSync(file, 'not json');
+    assert.strictEqual(gate.resolveHeadBranch({ GITHUB_EVENT_PATH: file, GITHUB_REF_NAME: 'master' }), 'master');
+  });
+
+  test('an unresolvable branch is empty rather than a guess', () => {
+    assert.strictEqual(gate.resolveHeadBranch({}), '');
+  });
+});
+
+describe('bypass-branch-prefixes', () => {
+  test('parses comma and newline separated lists, trimming both', () => {
+    assert.deepStrictEqual(gate.parseBypassPrefixes('hotfix/, emergency/'), ['hotfix/', 'emergency/']);
+    assert.deepStrictEqual(gate.parseBypassPrefixes('hotfix/\nemergency/\n'), ['hotfix/', 'emergency/']);
+  });
+
+  test('an empty input is no prefixes, so nothing is ever bypassed', () => {
+    assert.deepStrictEqual(gate.parseBypassPrefixes(''), []);
+    assert.deepStrictEqual(gate.parseBypassPrefixes(undefined), []);
+    assert.strictEqual(gate.matchedBypassPrefix('hotfix/x', []), null);
+  });
+
+  test('returns the prefix that matched, for the summary and the log', () => {
+    assert.strictEqual(gate.matchedBypassPrefix('hotfix/db-pool', ['hotfix/', 'emergency/']), 'hotfix/');
+    assert.strictEqual(gate.matchedBypassPrefix('emergency/now', ['hotfix/', 'emergency/']), 'emergency/');
+  });
+
+  test('an unrelated branch does not match', () => {
+    assert.strictEqual(gate.matchedBypassPrefix('feat/hotfix-docs', ['hotfix/']), null);
+    assert.strictEqual(gate.matchedBypassPrefix('master', ['hotfix/']), null);
+  });
+
+  test('an unresolved branch never matches', () => {
+    // The bypass publishes a passing gate, so an unknown branch has to fail
+    // closed. Matching on empty would open the gate wherever the payload is
+    // missing a branch.
+    assert.strictEqual(gate.matchedBypassPrefix('', ['hotfix/']), null);
+    assert.strictEqual(gate.matchedBypassPrefix(undefined, ['hotfix/']), null);
+  });
+
+  test('the published verdict passes and says it checked nothing', () => {
+    const body = gate.bypassCheckRun('gate', { branch: 'hotfix/db-pool', prefix: 'hotfix/' });
+    assert.strictEqual(body.status, 'completed');
+    assert.strictEqual(body.conclusion, 'success');
+    assert.match(body.title, /hotfix\/db-pool/);
+    assert.match(body.summary, /did not check anything/);
+    assert.match(body.summary, /hotfix\//);
+  });
+
+  test('a branch name cannot break out of the summary markdown', () => {
+    // Branch names are attacker-controlled on a fork PR and land in a markdown
+    // summary, same reason formatEntry uses codeSpan.
+    const body = gate.bypassCheckRun('gate', { branch: 'hotfix/`x`', prefix: 'hotfix/' });
+    assert.ok(!body.summary.includes('`x`'));
+  });
+});
+
 describe('watch mode: own check run is ignored', () => {
   const base = { currentRunId: '999', currentWorkflowFile: 'pr-gate.yml', skipSameWorkflow: true, skipList: [] };
   const ownId = gate.externalIdFor('gate');
