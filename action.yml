@@ -108,6 +108,25 @@ inputs:
       jobMatchMode is "exact" (default) or "prefix". Omit jobName to skip a whole workflow file.
     required: false
     default: '[]'
+  bypass-branch-prefixes:
+    description: |
+      Comma separated branch prefixes that wave the gate through, e.g.
+      'hotfix/,emergency/'. The gate publishes a pass without reading any other
+      check run, and the summary says which prefix matched.
+
+      This exists because watch mode cannot use a skipped job as its escape
+      hatch. In wait mode the required check is the job and GitHub counts a
+      skipped job as passing, so an `if:` guard works. In watch mode the required
+      check is the published check run, so a skipped job writes nothing, the
+      context never appears, and the merge blocks on a check that is never
+      coming. The hatch has to run and publish a pass instead.
+
+      The branch is resolved from the event payload, because on workflow_run
+      events GITHUB_HEAD_REF is empty and GITHUB_REF_NAME is the default branch,
+      which is why an expression on the caller's side cannot do this reliably.
+      A branch that cannot be resolved never matches.
+    required: false
+    default: ''
   early-exit:
     description: 'Fail as soon as a sibling job fails, instead of waiting for the rest to finish.'
     required: false

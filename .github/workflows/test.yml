@@ -86,7 +86,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          owned=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs?check_name=gate-smoke&filter=latest&per_page=100" \
+          owned=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs?check_name=gate-smoke&filter=all&per_page=100" \
             --jq '[.check_runs[] | select(.external_id == "muratkeremozcan/pr-gate:gate-smoke")]')
           count=$(echo "${owned}" | jq 'length')
           echo "gate-smoke check runs owned by pr-gate: ${count}"
@@ -97,3 +97,27 @@ jobs:
             -f 'output[title]=smoke test artifact, not a verdict' \
             -f 'output[summary]=Created and updated by the pr-gate smoke test to exercise the check-run write path. Says nothing about this PR.' \
             --silent
+
+      # The bypass is what a hotfix relies on while something is on fire, and it is
+      # the one path where publishing a pass is the correct behaviour. Worth proving
+      # live: a bypass that quietly fails to publish blocks the merge it exists to
+      # unblock. The prefix is the whole branch name, so it matches on both a PR and
+      # the push to main.
+      - name: Run the gate with this branch bypassed
+        uses: ./
+        with:
+          mode: watch
+          check-name: gate-smoke-bypass
+          bypass-branch-prefixes: ${{ github.head_ref || github.ref_name }}
+
+      - name: Assert the bypass published a pass that admits it checked nothing
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          owned=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs?check_name=gate-smoke-bypass&filter=all&per_page=100" \
+            --jq '[.check_runs[] | select(.external_id == "muratkeremozcan/pr-gate:gate-smoke-bypass")]')
+          test "$(echo "${owned}" | jq 'length')" -eq 1
+          test "$(echo "${owned}" | jq -r '.[0].conclusion')" = "success"
+          echo "${owned}" | jq -r '.[0].output.summary' | grep -q 'did not check anything'

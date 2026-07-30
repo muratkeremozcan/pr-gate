@@ -590,6 +590,66 @@ function resolveSha(env = process.env) {
   return env.GITHUB_SHA || '';
 }
 
+/**
+ * The head branch, for the bypass check.
+ *
+ * Same trap as the SHA. On workflow_run, GITHUB_REF_NAME is the default branch
+ * and GITHUB_HEAD_REF is empty, so a caller-side `startsWith(github.head_ref,
+ * 'hotfix/')` reads false on every event after the first. Resolving it here from
+ * the payload is the only way the bypass survives the switch of event type.
+ */
+function resolveHeadBranch(env = process.env) {
+  const payload = readEventPayload(env);
+  const fromPayload = payload?.pull_request?.head?.ref || payload?.workflow_run?.head_branch;
+  if (fromPayload) return String(fromPayload);
+  return String(env.GITHUB_HEAD_REF || env.GITHUB_REF_NAME || '');
+}
+
+/** Comma or newline separated, so both YAML styles work. */
+function parseBypassPrefixes(raw) {
+  return String(raw == null ? '' : raw)
+    .split(/[,\n]/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
+ * The prefix that waves this branch through, or null.
+ *
+ * An unresolved branch never matches. The bypass publishes a passing gate, so
+ * guessing here would open the gate on a commit nobody asked to exempt.
+ */
+function matchedBypassPrefix(branch, prefixes) {
+  const name = String(branch == null ? '' : branch).trim();
+  if (!name || !Array.isArray(prefixes) || prefixes.length === 0) return null;
+  return prefixes.find((prefix) => name.startsWith(prefix)) || null;
+}
+
+/**
+ * The check run body for a bypassed gate.
+ *
+ * Watch mode cannot use a skipped job as its escape hatch. In wait mode the
+ * required check was the job, and GitHub counts a skipped job as passing; here
+ * the required check is this check run, so a skipped job publishes nothing, the
+ * context never appears, and the merge blocks on a check that is never coming.
+ * The hatch therefore has to run and publish a pass.
+ *
+ * It says so in the summary. A skipped job was invisible unless you read the
+ * workflow file, and a bypassed gate is worth seeing on the PR.
+ */
+function bypassCheckRun(name, { branch, prefix }) {
+  return {
+    name,
+    status: 'completed',
+    conclusion: 'success',
+    title: `Bypassed for ${branch}`,
+    summary:
+      `This gate did not check anything. The branch ${codeSpan(branch)} matches the ` +
+      `bypass prefix ${codeSpan(prefix)}, so the verdict was published as a pass ` +
+      'without reading the other check runs on this commit.',
+  };
+}
+
 /** Stamped on every check run this action creates, so it can recognise its own. */
 function externalIdFor(checkName) {
   return `muratkeremozcan/pr-gate:${checkName}`;
@@ -733,6 +793,9 @@ function buildOptions() {
 
   const checkName = getInput('check-name') || 'gate';
 
+  const headBranch = resolveHeadBranch();
+  const bypassPrefix = matchedBypassPrefix(headBranch, parseBypassPrefixes(getInput('bypass-branch-prefixes')));
+
   const ctx = {
     apiUrl: getInput('github-api-url') || 'https://api.github.com',
     token,
@@ -747,6 +810,8 @@ function buildOptions() {
     ctx,
     mode,
     checkName,
+    headBranch,
+    bypassPrefix,
     retryMethod,
     warmupMs: parseDurationSeconds(getInput('warmup-delay'), 10) * 1000,
     minimumMs: parseDurationSeconds(getInput('minimum-interval'), 15) * 1000,
@@ -793,12 +858,29 @@ function warnUnmatchedSkips(all, skipList) {
  * stays green even when the gate is red.
  */
 async function runWatch(opts) {
-  const { ctx, checkName, skipOpts, earlyExit, dryRun, warmupMs } = opts;
+  const { ctx, checkName, headBranch, bypassPrefix, skipOpts, earlyExit, dryRun, warmupMs } = opts;
   const reportDropped = droppedReporter();
 
   log(`Gate (watch) on ${ctx.owner}/${ctx.repo}@${ctx.sha}, publishing check run "${checkName}"`);
   log(`  event: ${process.env.GITHUB_EVENT_NAME || '(unknown)'}, api retries: ${ctx.retryLimit}`);
   if (skipOpts.skipList.length > 0) log(`  skip-list: ${JSON.stringify(skipOpts.skipList)}`);
+
+  if (bypassPrefix) {
+    const verdict = bypassCheckRun(checkName, { branch: headBranch, prefix: bypassPrefix });
+    setOutput('polls', '0');
+    setOutput('conclusion', 'success');
+    if (dryRun) {
+      warn(`dry-run: would have bypassed the gate for ${headBranch} (matches "${bypassPrefix}")`);
+      return 0;
+    }
+    // Written straight to success with no invalidation step. The two-phase write
+    // exists so a failed write cannot leave a stale green behind, and the target
+    // here is green, so a failure leaves whatever was published before, which
+    // blocks. Fails closed either way.
+    await writeCheckRun(ctx, verdict, await findOwnedCheckRun(ctx, checkName));
+    notice(`Gate bypassed: ${headBranch} matches bypass-branch-prefixes entry "${bypassPrefix}". Published "${checkName}" as a pass without checking anything.`);
+    return 0;
+  }
 
   const collect = async () => {
     const all = flattenCheckSuites(await fetchChecks(ctx), reportDropped);
@@ -854,13 +936,23 @@ async function runWatch(opts) {
 }
 
 async function runWait(opts) {
-  const { ctx, skipOpts, earlyExit, dryRun, warmupMs, minimumMs, retryMethod, attemptLimits } = opts;
+  const { ctx, headBranch, bypassPrefix, skipOpts, earlyExit, dryRun, warmupMs, minimumMs, retryMethod, attemptLimits } = opts;
   const { owner, repo, sha } = ctx;
   const reportDropped = droppedReporter();
 
   log(`Gate (wait) on ${owner}/${repo}@${sha}`);
   log(`  api retries: ${ctx.retryLimit}, poll limit: ${attemptLimits}, interval: ${minimumMs / 1000}s (${retryMethod})`);
   if (skipOpts.skipList.length > 0) log(`  skip-list: ${JSON.stringify(skipOpts.skipList)}`);
+
+  // Wait mode publishes nothing, so the bypass is just an early exit. Handled
+  // here as well as in watch mode so the input means the same thing in both, and
+  // so a caller can migrate modes without the escape hatch changing behaviour.
+  if (bypassPrefix) {
+    setOutput('polls', '0');
+    setOutput('conclusion', 'success');
+    notice(`Gate bypassed: ${headBranch} matches bypass-branch-prefixes entry "${bypassPrefix}". Nothing was checked.`);
+    return 0;
+  }
 
   let polls = 0;
   let warnedUnmatchedSkips = false;
@@ -960,6 +1052,10 @@ module.exports = {
   formatEntry,
   codeSpan,
   verdictCheckRun,
+  resolveHeadBranch,
+  parseBypassPrefixes,
+  matchedBypassPrefix,
+  bypassCheckRun,
   externalIdFor,
   findOwnedCheckRun,
   writeCheckRun,

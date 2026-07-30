@@ -106,10 +106,30 @@ with:
 `jobMatchMode` accepts `exact` or `prefix`. Omit `jobName` to skip an entire
 workflow.
 
+Use `bypass-branch-prefixes` to wave a branch through without checking anything:
+
+```yaml
+with:
+  mode: watch
+  bypass-branch-prefixes: 'hotfix/,emergency/'
+```
+
+The gate publishes a passing check run whose summary names the branch and the
+prefix that matched. In watch mode this is the only workable escape hatch. The
+required check is the published check run, so a job skipped by an `if:` condition
+publishes nothing, the required check never appears, and the merge blocks instead
+of proceeding. The branch is resolved from the event payload, because
+`github.head_ref` is empty on `workflow_run` events and an expression on the
+caller's side would stop matching after the initial `pull_request` event.
+
 ## Important behavior
 
 - Watch mode owns its check run through an `external_id`. It refuses to update
   a same-named check run created by another tool.
+- In watch mode a job skipped by an `if:` condition publishes no verdict, so the
+  required check never appears and the merge blocks. Wait mode is the opposite,
+  because there the required check is the job and a skipped job counts as passing.
+  Use `bypass-branch-prefixes` for an escape hatch that works in both modes.
 - The action reads GitHub check runs. Commit statuses and check suites from
   non-Actions apps must be required separately when needed.
 - A commit with no visible sibling check runs passes after `warmup-delay`.
@@ -122,7 +142,7 @@ workflow.
 node --test tests/*.test.js
 ```
 
-The suite contains 146 tests and requires no dependency installation. The
+The suite contains 160 tests and requires no dependency installation. The
 action uses the Node 24 GitHub Actions runtime. The `Test` workflow also
 exercises both modes against the live GitHub API and publishes a temporary
 `gate-smoke` check run.
