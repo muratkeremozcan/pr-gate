@@ -932,6 +932,7 @@ describe('upsertCheckRun', () => {
     // The first POST may have created the run server-side while its response
     // was lost. The retry must re-check ownership before POSTing again, and the
     // lost POST already carried this verdict, so finding the run settles it.
+    // Two check runs of one name would flip the required context between them.
     let gets = 0;
     let posts = 0;
     global.fetch = async (url, init) => {
@@ -963,8 +964,225 @@ describe('upsertCheckRun', () => {
   });
 });
 
+describe('parsePublish', () => {
+  test('defaults to check-run, so an existing caller keeps the behaviour it has', () => {
+    assert.strictEqual(gate.parsePublish(''), 'check-run');
+    assert.strictEqual(gate.parsePublish(undefined), 'check-run');
+  });
+
+  for (const value of ['check-run', 'status']) {
+    test(`accepts ${value}`, () => {
+      assert.strictEqual(gate.parsePublish(` ${value} `), value);
+    });
+  }
+
+  for (const bad of ['commit-status', 'checkrun', 'both', 'true']) {
+    test(`rejects ${JSON.stringify(bad)} rather than falling back to a primitive nobody asked for`, () => {
+      assert.throws(() => gate.parsePublish(bad), /publish must be check-run or status/);
+    });
+  }
+});
+
+describe('verdictStatus', () => {
+  const entry = (name, conclusion) => ({
+    name,
+    status: conclusion ? 'COMPLETED' : 'IN_PROGRESS',
+    conclusion,
+    workflowName: 'Playwright e2e',
+  });
+
+  const pending = { done: false, ok: true, pending: [entry('pw-e2e (2, 2)', null)], bad: [] };
+  const passed = { done: true, ok: true, pending: [], bad: [] };
+  const failed = { done: true, ok: false, pending: [], bad: [entry('pw-e2e (2, 2)', 'FAILURE')] };
+
+  test('an unfinished verdict is pending, which a ruleset reads as blocking', () => {
+    const status = gate.verdictStatus(pending, { context: 'gate', totalWatched: 5 });
+    assert.strictEqual(status.state, 'pending');
+    assert.strictEqual(status.context, 'gate');
+  });
+
+  test('the failing description names the job, which is the point of publishing a status', () => {
+    // The whole confusion this primitive exists to fix is a pull request page
+    // that named an unrelated workflow. The replacement has to name the culprit.
+    const status = gate.verdictStatus(failed, { context: 'gate', totalWatched: 5 });
+    assert.strictEqual(status.state, 'failure');
+    assert.strictEqual(status.description, '1 job(s) did not pass: Playwright e2e / pw-e2e (2, 2): failure');
+  });
+
+  test('a pending description names what it is still waiting on', () => {
+    const status = gate.verdictStatus(pending, { context: 'gate', totalWatched: 5 });
+    assert.match(status.description, /Waiting on 1 of 5 job\(s\): Playwright e2e \/ pw-e2e \(2, 2\)/);
+  });
+
+  test('a passing verdict has nothing to name, so the description is just the title', () => {
+    const status = gate.verdictStatus(passed, { context: 'gate', totalWatched: 5 });
+    assert.strictEqual(status.state, 'success');
+    assert.strictEqual(status.description, 'All 5 watched job(s) passed');
+  });
+
+  test('the description is trimmed to what the endpoint accepts', () => {
+    // A rejected write loses the verdict, and a matrix can produce a lot of
+    // failures, so the length is bounded here rather than at GitHub's discretion.
+    const many = { done: true, ok: false, pending: [], bad: Array.from({ length: 40 }, (_, i) => entry(`job-number-${i}`, 'FAILURE')) };
+    const status = gate.verdictStatus(many, { context: 'gate', totalWatched: 40 });
+    assert.ok(status.description.length <= 140, `got ${status.description.length}`);
+    assert.ok(status.description.endsWith('…'), 'the reader can see it was cut');
+  });
+
+  test('it carries the check run markdown too, for the job summary', () => {
+    const status = gate.verdictStatus(failed, { context: 'gate', totalWatched: 5 });
+    assert.match(status.summary, /Failed:/);
+    assert.match(status.summary, /`Playwright e2e \/ pw-e2e \(2, 2\): failure`/);
+  });
+
+  test('the two primitives cannot disagree about the same result', () => {
+    // Both are derived from one verdict on purpose. A repo switching `publish`
+    // mid-flight would otherwise be gated on two different readings of one commit.
+    for (const result of [pending, passed, failed]) {
+      const asCheckRun = gate.verdictCheckRun(result, { name: 'gate', totalWatched: 5 });
+      const asStatus = gate.verdictStatus(result, { context: 'gate', totalWatched: 5 });
+      assert.strictEqual(asStatus.state, gate.statusState(asCheckRun));
+      assert.strictEqual(asStatus.title, asCheckRun.title);
+      assert.strictEqual(asStatus.summary, asCheckRun.summary);
+    }
+  });
+});
+
+describe('statusState', () => {
+  test('unfinished is pending, and a ruleset treats pending as unmergeable', () => {
+    assert.strictEqual(gate.statusState({ status: 'in_progress' }), 'pending');
+  });
+
+  test('only success is success; every other conclusion fails closed', () => {
+    assert.strictEqual(gate.statusState({ status: 'completed', conclusion: 'success' }), 'success');
+    for (const conclusion of ['failure', 'cancelled', 'timed_out', 'action_required', undefined]) {
+      assert.strictEqual(gate.statusState({ status: 'completed', conclusion }), 'failure');
+    }
+  });
+});
+
+describe('plainText', () => {
+  test('a newline in a job name cannot break the single-line description', () => {
+    // A status description is plain text, so the markdown escaping codeSpan does
+    // is the wrong tool, but a name spanning lines still has to be flattened.
+    assert.strictEqual(gate.plainText('a\nb\tc  d'), 'a b c d');
+    assert.strictEqual(gate.plainText(null), '');
+  });
+
+  test('it does not strip backticks, because there is no markdown here to escape', () => {
+    assert.strictEqual(gate.plainText('a`b'), 'a`b');
+  });
+});
+
+describe('bypassStatus', () => {
+  test('publishes a pass whose summary still admits it checked nothing', () => {
+    const status = gate.bypassStatus('gate', { branch: 'hotfix/pager', prefix: 'hotfix/' });
+    assert.strictEqual(status.state, 'success');
+    assert.match(status.description, /Bypassed for hotfix\/pager/);
+    assert.match(status.summary, /did not check anything/);
+  });
+});
+
+describe('invalidationStatus', () => {
+  test('pending, so a write that fails after it blocks instead of merging on a stale green', () => {
+    assert.strictEqual(gate.invalidationStatus('gate').state, 'pending');
+    assert.strictEqual(gate.invalidationStatus('gate').context, 'gate');
+  });
+});
+
+describe('workflowRunUrl', () => {
+  test('points at this run, which is where the summary the description cannot hold lives', () => {
+    assert.strictEqual(
+      gate.workflowRunUrl({ GITHUB_SERVER_URL: 'https://github.com/', GITHUB_REPOSITORY: 'o/r', GITHUB_RUN_ID: '9' }),
+      'https://github.com/o/r/actions/runs/9'
+    );
+  });
+
+  test('empty rather than a broken link when the environment is incomplete', () => {
+    assert.strictEqual(gate.workflowRunUrl({ GITHUB_REPOSITORY: 'o/r' }), '');
+    assert.strictEqual(gate.workflowRunUrl({ GITHUB_RUN_ID: '9' }), '');
+  });
+});
+
+describe('writeCommitStatus', () => {
+  const originalFetch = global.fetch;
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  const ctx = { apiUrl: 'https://api.github.invalid', token: 't', owner: 'o', repo: 'r', sha: 'deadbeef', retryLimit: 3, baseDelayMs: 0 };
+  const res = (status, body) => ({
+    ok: status >= 200 && status < 300,
+    status,
+    headers: new Headers(),
+    json: async () => body,
+    text: async () => JSON.stringify(body),
+  });
+
+  const verdict = { context: 'gate', state: 'failure', description: 'pw-e2e (2, 2) failed' };
+
+  test('posts to the commit, with the context a ruleset requires', async () => {
+    const calls = [];
+    global.fetch = async (url, init) => {
+      calls.push({ url, method: init.method, body: JSON.parse(init.body) });
+      return res(201, { id: 1 });
+    };
+    await gate.writeCommitStatus(ctx, verdict, 'https://github.com/o/r/actions/runs/9');
+
+    assert.strictEqual(calls.length, 1);
+    assert.match(calls[0].url, /\/repos\/o\/r\/statuses\/deadbeef$/);
+    assert.strictEqual(calls[0].method, 'POST');
+    assert.deepStrictEqual(calls[0].body, {
+      state: 'failure',
+      context: 'gate',
+      description: 'pw-e2e (2, 2) failed',
+      target_url: 'https://github.com/o/r/actions/runs/9',
+    });
+  });
+
+  test('omits target_url rather than sending an empty one', async () => {
+    let sent;
+    global.fetch = async (url, init) => {
+      sent = JSON.parse(init.body);
+      return res(201, { id: 1 });
+    };
+    await gate.writeCommitStatus(ctx, verdict, '');
+    assert.ok(!('target_url' in sent));
+  });
+
+  test('a 502 is retried, so a blip does not lose the verdict', async () => {
+    let calls = 0;
+    global.fetch = async () => {
+      calls += 1;
+      return calls < 3 ? res(502, { message: 'bad gateway' }) : res(201, { id: 1 });
+    };
+    await gate.writeCommitStatus(ctx, verdict, '');
+    assert.strictEqual(calls, 3);
+  });
+
+  test('needs no lost-response guard, because a repeat supersedes instead of duplicating', async () => {
+    // The check-run create has to re-check ownership before retrying or it leaves
+    // two check runs of one required name. A status has no id and no ownership:
+    // the latest post for a context wins, so the retry is free to be blind.
+    let posts = 0;
+    global.fetch = async () => {
+      posts += 1;
+      throw new Error('socket hang up');
+    };
+    await assert.rejects(() => gate.writeCommitStatus(ctx, verdict, ''), /network error/);
+    assert.strictEqual(posts, ctx.retryLimit + 1);
+  });
+
+  test('a 422 is surfaced rather than retried away', async () => {
+    global.fetch = async () => res(422, { message: 'Invalid request' });
+    await assert.rejects(() => gate.writeCommitStatus(ctx, verdict, ''), /422/);
+  });
+});
+
 describe('parseIntOr', () => {
   test('missing or non-numeric input falls back instead of producing NaN', () => {
+    // NaN is the dangerous case: `attempt > NaN` is false, so a NaN retryLimit
+    // retries forever and a NaN attemptLimits never polls.
     assert.strictEqual(gate.parseIntOr('', 5), 5);
     assert.strictEqual(gate.parseIntOr(undefined, 5), 5);
     assert.strictEqual(gate.parseIntOr('abc', 5), 5);

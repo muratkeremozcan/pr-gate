@@ -34,6 +34,7 @@ jobs:
     permissions:
       contents: read
       checks: write # write, so the watch-mode step can publish gate-smoke
+      statuses: write # for the publish: status leg
       actions: read
     steps:
       - uses: actions/checkout@v4
@@ -97,6 +98,50 @@ jobs:
             -f 'output[title]=smoke test artifact, not a verdict' \
             -f 'output[summary]=Created and updated by the pr-gate smoke test to exercise the check-run write path. Says nothing about this PR.' \
             --silent
+
+      # publish: status goes through a different endpoint with different
+      # permissions, so the stub in the unit tests says nothing about whether the
+      # real POST is accepted. `gate-smoke-status` is required by no ruleset.
+      - name: Run the gate in watch mode, publishing a commit status
+        uses: ./
+        with:
+          mode: watch
+          publish: status
+          warmup-delay: PT5S
+          check-name: gate-smoke-status
+
+      # A commit status is not a check run: it has no id and no ownership, so a
+      # second run supersedes rather than duplicating. Worth proving live, because
+      # that property is the reason the status write needs no lost-response guard.
+      - name: Run it again, then assert one context carrying the latest state
+        uses: ./
+        with:
+          mode: watch
+          publish: status
+          warmup-delay: '0'
+          check-name: gate-smoke-status
+
+      - name: Assert the status exists, names its jobs, and links to this run
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          combined=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/status" \
+            --jq '[.statuses[] | select(.context == "gate-smoke-status")]')
+          echo "${combined}" | jq .
+
+          # The combined endpoint reports one entry per context, the latest one,
+          # so two runs must still leave exactly one required context behind.
+          test "$(echo "${combined}" | jq 'length')" -eq 1
+
+          # 140 is the endpoint's cap. Asserted live because exceeding it is the
+          # one way this write can be rejected and lose a verdict.
+          desc=$(echo "${combined}" | jq -r '.[0].description')
+          echo "description (${#desc} chars): ${desc}"
+          test "${#desc}" -le 140
+
+          echo "${combined}" | jq -r '.[0].target_url' | grep -q "actions/runs/${GITHUB_RUN_ID}"
 
       # The bypass is what a hotfix relies on while something is on fire, and it is
       # the one path where publishing a pass is the correct behaviour. Worth proving
