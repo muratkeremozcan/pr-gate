@@ -33,7 +33,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      checks: write # write, so the watch-mode step can publish gate-smoke
+      checks: read
+      statuses: write # so the watch-mode steps can publish their verdict
       actions: read
     steps:
       - uses: actions/checkout@v4
@@ -52,51 +53,48 @@ jobs:
           minimum-interval: PT5S
           attempt-limits: '3'
 
-      # Watch mode for real, not dry-run: the check-run write is the one path unit
+      # Watch mode for real, not dry-run: the status write is the one path unit
       # tests can only reach through a stubbed fetch, so a live POST against the API
-      # is the point of this step. `gate-smoke` is required by no ruleset, so
+      # is the point of this step. `gate-smoke-status` is required by no ruleset, so
       # publishing it gates nothing.
-      - name: Run the gate in watch mode, creating the check run
+      - name: Run the gate in watch mode, publishing a commit status
         uses: ./
         with:
           mode: watch
           warmup-delay: PT5S
-          check-name: gate-smoke
+          check-name: gate-smoke-status
 
-      # A second run is how every event after the first behaves: find the check run
-      # this action owns by external_id and update it. That lookup is the part that
-      # can hijack another tool's check or duplicate the required status context, so
-      # it is worth proving against the real API and not only a stub.
-      - name: Run the gate in watch mode again, updating the same check run
+      # A commit status has no id and no ownership, so a second run supersedes
+      # rather than duplicating. Worth proving live, because that property is the
+      # reason the write needs no lost-response guard.
+      - name: Run it again, then assert one context carrying the latest state
         uses: ./
         with:
           mode: watch
           warmup-delay: '0'
-          check-name: gate-smoke
+          check-name: gate-smoke-status
 
-      # One check run of that name, or the required status context would flip
-      # between duplicates depending on which was written last.
-      #
-      # Then close it out. The verdict here is a test artifact about whichever
-      # siblings happened to be running, and leaving it in_progress would park a
-      # permanently pending check on every PR in this repo.
-      - name: Assert the second run updated rather than duplicated, then close it
+      - name: Assert the status exists, names its jobs, and links to this run
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          owned=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs?check_name=gate-smoke&filter=all&per_page=100" \
-            --jq '[.check_runs[] | select(.external_id == "muratkeremozcan/pr-gate:gate-smoke")]')
-          count=$(echo "${owned}" | jq 'length')
-          echo "gate-smoke check runs owned by pr-gate: ${count}"
-          test "${count}" -eq 1
+          combined=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/status" \
+            --jq '[.statuses[] | select(.context == "gate-smoke-status")]')
+          echo "${combined}" | jq .
 
-          gh api -X PATCH "repos/${GITHUB_REPOSITORY}/check-runs/$(echo "${owned}" | jq '.[0].id')" \
-            -f status=completed -f conclusion=neutral \
-            -f 'output[title]=smoke test artifact, not a verdict' \
-            -f 'output[summary]=Created and updated by the pr-gate smoke test to exercise the check-run write path. Says nothing about this PR.' \
-            --silent
+          # The combined endpoint reports one entry per context, the latest one,
+          # so two runs must still leave exactly one required context behind.
+          test "$(echo "${combined}" | jq 'length')" -eq 1
+
+          # 140 is the endpoint's cap. Asserted live because exceeding it is the
+          # one way this write can be rejected and lose a verdict.
+          desc=$(echo "${combined}" | jq -r '.[0].description')
+          echo "description (${#desc} chars): ${desc}"
+          test "${#desc}" -le 140
+
+          echo "${combined}" | jq -r '.[0].target_url' | grep -q "actions/runs/${GITHUB_RUN_ID}"
 
       # The bypass is what a hotfix relies on while something is on fire, and it is
       # the one path where publishing a pass is the correct behaviour. Worth proving
@@ -116,8 +114,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          owned=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/check-runs?check_name=gate-smoke-bypass&filter=all&per_page=100" \
-            --jq '[.check_runs[] | select(.external_id == "muratkeremozcan/pr-gate:gate-smoke-bypass")]')
-          test "$(echo "${owned}" | jq 'length')" -eq 1
-          test "$(echo "${owned}" | jq -r '.[0].conclusion')" = "success"
-          echo "${owned}" | jq -r '.[0].output.summary' | grep -q 'did not check anything'
+          bypass=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${SHA}/status" \
+            --jq '[.statuses[] | select(.context == "gate-smoke-bypass")]')
+          echo "${bypass}" | jq .
+          test "$(echo "${bypass}" | jq 'length')" -eq 1
+          test "$(echo "${bypass}" | jq -r '.[0].state')" = "success"
+          echo "${bypass}" | jq -r '.[0].description' | grep -q 'nothing was checked'

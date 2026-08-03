@@ -25,8 +25,8 @@ description: |
 
   Two modes. `wait` blocks a job until the siblings finish, which is simple but
   occupies a runner for as long as the slowest job. `watch` recomputes the
-  verdict on each CI completion event and publishes it as a check run, costing
-  seconds per event instead of minutes of idling.
+  verdict on each CI completion event and publishes it as a commit status,
+  costing seconds per event instead of minutes of idling.
 
   Copy-paste workflows for both modes are in pr-gate/README.md. They are not
   repeated here, because Actions evaluates expression syntax anywhere in this file
@@ -42,19 +42,19 @@ inputs:
 
       'wait' occupies this job until every sibling check run finishes, then sets
       the job's own exit code. 'watch' computes the verdict once from the current
-      state of the commit, publishes it as the check run named by check-name, and
-      exits immediately. Watch mode needs `checks: write` and is meant to be
+      state of the commit, publishes it as the commit status named by check-name,
+      and exits immediately. Watch mode needs `statuses: write` and is meant to be
       driven by workflow_run completion events.
     required: true
   check-name:
     description: |
-      Watch mode only. Name of the published check run, which is also the status
+      Watch mode only. Context of the published commit status, which is the status
       context a branch ruleset requires. Must stay stable, and must not collide
       with the name of the job running this action.
     required: false
     default: 'gate'
   github-token:
-    description: 'Token used for the GitHub API. Needs read access to checks and actions; watch mode also needs checks: write to publish the verdict.'
+    description: 'Token used for the GitHub API. Needs read access to checks and actions; watch mode also needs statuses: write to publish the verdict.'
     required: false
     default: '${{ github.token }}'
   github-api-url:
@@ -117,9 +117,9 @@ inputs:
       This exists because watch mode cannot use a skipped job as its escape
       hatch. In wait mode the required check is the job and GitHub counts a
       skipped job as passing, so an `if:` guard works. In watch mode the required
-      check is the published check run, so a skipped job writes nothing, the
-      context never appears, and the merge blocks on a check that is never
-      coming. The hatch has to run and publish a pass instead.
+      check is the published status, so a skipped job writes nothing, the context
+      never appears, and the merge blocks on a check that is never coming. The
+      hatch has to run and publish a pass instead.
 
       The branch is resolved from the event payload, because on workflow_run
       events GITHUB_HEAD_REF is empty and GITHUB_REF_NAME is the default branch,
