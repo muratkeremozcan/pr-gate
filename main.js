@@ -89,6 +89,19 @@ function parseMode(raw) {
   return mode;
 }
 
+/**
+ * Which primitive watch mode publishes its verdict as. Defaults, unlike `mode`,
+ * because both values gate identically and an existing caller must keep the
+ * behaviour it already has.
+ */
+function parsePublish(raw) {
+  const publish = String(raw == null ? '' : raw).trim() || 'check-run';
+  if (!['check-run', 'status'].includes(publish)) {
+    throw new Error(`publish must be check-run or status, got "${publish}"`);
+  }
+  return publish;
+}
+
 const OK_CONCLUSIONS = new Set(['success', 'skipped', 'neutral']);
 
 /** 'pending' | 'ok' | 'bad'. Anything completed and not explicitly OK is bad. */
@@ -132,11 +145,11 @@ function currentWorkflowFile(env = process.env) {
 }
 
 function shouldSkip(entry, { currentRunId, currentWorkflowFile: ownFile, skipSameWorkflow, skipList, ownExternalId }) {
-  // Watch mode used to publish its verdict as a check run on the same commit it
-  // is inspecting. Without this the gate reads that abandoned verdict as a
-  // sibling and, once it is a failure, can never recover to success.
+  // Watch mode publishes its verdict as a check run on the same commit it is
+  // inspecting. Without this the gate reads its own previous verdict as a
+  // sibling and, once that verdict is a failure, can never recover to success.
   //
-  // Matched on external_id, which this action set and owned, rather than on the
+  // Matched on external_id, which this action sets and owns, rather than on the
   // check run's name. Name matching would also silence a legitimate sibling job
   // that happens to be called `gate`.
   if (ownExternalId && String(entry.externalId || '') === ownExternalId) return true;
@@ -216,9 +229,9 @@ function codeSpan(text) {
   return `\`${String(text == null ? '' : text).replace(/`/g, '')}\``;
 }
 
-// A monorepo with a big matrix can produce a lot of entries, and this list goes
-// into the job summary, which GitHub caps at 1MB per step. Bounded well short of
-// that, since a reader scanning for the culprit does not want a hundred lines.
+// The Checks API rejects an output.summary over 65535 characters, and a monorepo
+// with a big matrix can produce a lot of entries. A rejected write loses the
+// verdict entirely, so the list is bounded well short of the limit.
 const MAX_LISTED_ENTRIES = 30;
 
 function entryList(heading, entries) {
@@ -228,6 +241,43 @@ function entryList(heading, entries) {
     lines.push(`- and ${entries.length - shown.length} more`);
   }
   return [heading, ...lines].join('\n');
+}
+
+/**
+ * The check run body for a verdict, for watch mode.
+ *
+ * A `done` verdict becomes a terminal conclusion. Anything else stays
+ * `in_progress`, which reads as pending to the branch ruleset and so keeps
+ * blocking the merge. That is the fail-closed direction: a gate that never hears
+ * about the last sibling leaves the PR unmergeable rather than mergeable.
+ */
+function verdictCheckRun(result, { name, totalWatched }) {
+  if (!result.done) {
+    return {
+      name,
+      status: 'in_progress',
+      title: `Waiting on ${result.pending.length} of ${totalWatched} job(s)`,
+      summary: entryList('Still running:', result.pending),
+    };
+  }
+  if (result.ok) {
+    return {
+      name,
+      status: 'completed',
+      conclusion: 'success',
+      title: `All ${totalWatched} watched job(s) passed`,
+      summary: totalWatched === 0
+        ? 'No other check runs on this commit, so there was nothing to gate.'
+        : 'Every watched check run on this commit finished and passed.',
+    };
+  }
+  return {
+    name,
+    status: 'completed',
+    conclusion: 'failure',
+    title: `${result.bad.length} job(s) did not pass`,
+    summary: entryList('Failed:', result.bad),
+  };
 }
 
 // The statuses endpoint caps `description` at 140 characters, so the list of
@@ -247,12 +297,10 @@ function plainText(text) {
 function truncateForStatus(text) {
   const line = plainText(text);
   if (line.length <= MAX_STATUS_DESCRIPTION) return line;
-  // Cut on a code point boundary, counting the UTF-16 length of each one so the
-  // result still fits the endpoint's limit. Slicing by unit instead leaves half
-  // a surrogate pair whenever the cut lands inside an emoji, which a job name in
-  // a workflow file is free to contain. A lone surrogate is not well-formed
-  // text, and a write rejected for carrying one loses the verdict this trimming
-  // exists to protect.
+
+  // Count UTF-16 units without cutting a Unicode code point in half. GitHub's
+  // limit is measured in characters accepted by the endpoint, while JavaScript
+  // slicing can leave a lone surrogate when an emoji crosses the boundary.
   let kept = '';
   for (const char of line) {
     if (kept.length + char.length > MAX_STATUS_DESCRIPTION - 1) break;
@@ -272,48 +320,28 @@ function statusDescription(title, entries) {
   return truncateForStatus(named ? `${title}: ${named}` : title);
 }
 
+/** A check run's status and conclusion collapsed onto the four status states. */
+function statusState(checkRun) {
+  if (checkRun.status !== 'completed') return 'pending';
+  return checkRun.conclusion === 'success' ? 'success' : 'failure';
+}
+
 /**
- * The commit status for a verdict, for watch mode.
+ * The commit status for a verdict, derived from the check run body so the two
+ * primitives cannot drift into disagreeing about the same commit.
  *
- * A `done` verdict becomes `success` or `failure`. Anything else stays
- * `pending`, which a branch ruleset reads as unfinished and so keeps blocking
- * the merge. That is the fail-closed direction: a gate that never hears about
- * the last sibling leaves the pull request unmergeable rather than mergeable.
- *
- * `title` and `summary` do not go to the statuses endpoint, whose description is
- * a single 140-character line. They are the markdown for the job summary, which
- * `target_url` points at.
+ * `pending` is what carries the fail-closed property here. It is what a ruleset
+ * reads as unfinished, so a gate that never hears about the last sibling leaves
+ * the pull request unmergeable rather than mergeable.
  */
 function verdictStatus(result, { context, totalWatched }) {
-  if (!result.done) {
-    const title = `Waiting on ${result.pending.length} of ${totalWatched} job(s)`;
-    return {
-      context,
-      state: 'pending',
-      description: statusDescription(title, result.pending),
-      title,
-      summary: entryList('Still running:', result.pending),
-    };
-  }
-  if (result.ok) {
-    const title = `All ${totalWatched} watched job(s) passed`;
-    return {
-      context,
-      state: 'success',
-      description: statusDescription(title, []),
-      title,
-      summary: totalWatched === 0
-        ? 'No other check runs on this commit, so there was nothing to gate.'
-        : 'Every watched check run on this commit finished and passed.',
-    };
-  }
-  const title = `${result.bad.length} job(s) did not pass`;
+  const checkRun = verdictCheckRun(result, { name: context, totalWatched });
   return {
     context,
-    state: 'failure',
-    description: statusDescription(title, result.bad),
-    title,
-    summary: entryList('Failed:', result.bad),
+    state: statusState(checkRun),
+    description: statusDescription(checkRun.title, result.done ? result.bad : result.pending),
+    title: checkRun.title,
+    summary: checkRun.summary,
   };
 }
 
@@ -465,9 +493,10 @@ const SUITE_RUNS_QUERY = /* GraphQL */ `
  * purpose, so `api-retry-limit` bounds the total call count rather than being
  * spent twice over.
  *
- * Every request this action makes is idempotent, so a retry needs no guard
- * against a lost response having landed server-side: a repeated status POST
- * supersedes itself rather than accumulating a second verdict.
+ * `retryGuard` is for non-idempotent requests. It runs before each retry, and a
+ * non-null return settles the call without sending the request again. A create
+ * whose response was lost may have landed server-side, and blind retries would
+ * then duplicate it; the guard re-checks instead.
  */
 async function requestWithRetry({
   apiUrl,
@@ -478,8 +507,19 @@ async function requestWithRetry({
   retryLimit,
   baseDelayMs,
   retryBody,
+  retryGuard,
 }) {
   const endpoint = `${String(apiUrl || 'https://api.github.com').replace(/\/+$/, '')}${path}`;
+
+  // A failed guard must not eat the retry budget, so its errors read as "keep retrying".
+  const settledByGuard = async () => {
+    if (!retryGuard) return null;
+    try {
+      return (await retryGuard()) ?? null;
+    } catch {
+      return null;
+    }
+  };
 
   for (let attempt = 1; ; attempt += 1) {
     let res;
@@ -499,6 +539,8 @@ async function requestWithRetry({
       if (attempt > retryLimit) {
         throw new Error(`network error contacting the GitHub API: ${err.message}`);
       }
+      const settled = await settledByGuard();
+      if (settled != null) return settled;
       const waitMs = backoffMs(attempt, baseDelayMs);
       warn(`Network error contacting the GitHub API (${err.message}), retrying in ${Math.round(waitMs / 1000)}s (${attempt}/${retryLimit})`);
       await sleep(waitMs);
@@ -508,6 +550,8 @@ async function requestWithRetry({
     if (!res.ok) {
       const text = await res.text().catch(() => '');
       if (isRetryableStatus(res.status, res.headers) && attempt <= retryLimit) {
+        const settled = await settledByGuard();
+        if (settled != null) return settled;
         const waitMs = retryAfterMs(res.headers) ?? backoffMs(attempt, baseDelayMs);
         warn(`GitHub API returned ${res.status}, retrying in ${Math.round(waitMs / 1000)}s (${attempt}/${retryLimit})`);
         await sleep(waitMs);
@@ -519,6 +563,8 @@ async function requestWithRetry({
     const json = await res.json().catch(() => null);
     if (!json) {
       if (attempt <= retryLimit) {
+        const settled = await settledByGuard();
+        if (settled != null) return settled;
         const waitMs = backoffMs(attempt, baseDelayMs);
         warn(`GitHub API returned an unparseable body, retrying in ${Math.round(waitMs / 1000)}s (${attempt}/${retryLimit})`);
         await sleep(waitMs);
@@ -565,8 +611,8 @@ async function graphql({ apiUrl, token, query, variables, retryLimit, baseDelayM
 }
 
 /** REST counterpart, same retry rules. Used only by watch mode's check-run writes. */
-function rest({ apiUrl, token, retryLimit, baseDelayMs }, method, path, body) {
-  return requestWithRetry({ apiUrl, token, method, path, body, retryLimit, baseDelayMs });
+function rest({ apiUrl, token, retryLimit, baseDelayMs }, method, path, body, retryGuard) {
+  return requestWithRetry({ apiUrl, token, method, path, body, retryLimit, baseDelayMs, retryGuard });
 }
 
 async function fetchChecks(ctx) {
@@ -658,25 +704,22 @@ function matchedBypassPrefix(branch, prefixes) {
 }
 
 /**
- * The commit status for a bypassed gate.
+ * The check run body for a bypassed gate.
  *
  * Watch mode cannot use a skipped job as its escape hatch. In wait mode the
  * required check was the job, and GitHub counts a skipped job as passing; here
- * the required check is the published status, so a skipped job publishes nothing,
- * the context never appears, and the merge blocks on a check that is never
- * coming. The hatch therefore has to run and publish a pass.
+ * the required check is this check run, so a skipped job publishes nothing, the
+ * context never appears, and the merge blocks on a check that is never coming.
+ * The hatch therefore has to run and publish a pass.
  *
- * It says so, in both the description and the summary. A skipped job was
- * invisible unless you read the workflow file, and a bypassed gate is worth
- * seeing on the pull request.
+ * It says so in the summary. A skipped job was invisible unless you read the
+ * workflow file, and a bypassed gate is worth seeing on the PR.
  */
-function bypassStatus(context, { branch, prefix }) {
+function bypassCheckRun(name, { branch, prefix }) {
   return {
-    context,
-    state: 'success',
-    description: truncateForStatus(
-      `Bypassed for ${branch}: matches the bypass prefix ${prefix}, so nothing was checked`
-    ),
+    name,
+    status: 'completed',
+    conclusion: 'success',
     title: `Bypassed for ${branch}`,
     summary:
       `This gate did not check anything. The branch ${codeSpan(branch)} matches the ` +
@@ -685,26 +728,85 @@ function bypassStatus(context, { branch, prefix }) {
   };
 }
 
-/**
- * Identifies a check run published by an older version of this action, back when
- * watch mode wrote one instead of a status.
- *
- * Nothing writes this any more. It is kept so a commit gated before the switch is
- * still recognised: that check run holds the same required context, and counting
- * it as a sibling would leave the gate pending on an abandoned verdict of its own.
- */
+/** The same bypass, as a commit status. Summary reused so the two cannot drift. */
+function bypassStatus(context, { branch, prefix }) {
+  const checkRun = bypassCheckRun(context, { branch, prefix });
+  return {
+    context,
+    state: 'success',
+    description: truncateForStatus(
+      `Bypassed for ${branch}: matches the bypass prefix ${prefix}, so nothing was checked`
+    ),
+    title: checkRun.title,
+    summary: checkRun.summary,
+  };
+}
+
+/** Stamped on every check run this action creates, so it can recognise its own. */
 function externalIdFor(checkName) {
   return `muratkeremozcan/pr-gate:${checkName}`;
 }
 
 /**
- * The status that invalidates a terminal verdict before it is recomputed.
+ * Finds the check run this action owns on the commit, or null on the first event.
+ *
+ * Ownership is decided by external_id, not by the name. Patching a same-named
+ * check run this action did not create would hijack someone else's check, and two
+ * writers on one name means the context flips to whoever wrote last, so a foreign
+ * owner is an error rather than something to write through.
+ */
+async function findOwnedCheckRun(ctx, name) {
+  const externalId = externalIdFor(name);
+  // filter=all, not the default latest. `latest` is scoped to the newest check
+  // suite, so rerunning any workflow can hide the check run this action already
+  // owns; the lookup then finds nothing and creates a second one of the same
+  // required name, which is exactly what owning it is supposed to prevent.
+  const found = await rest(
+    ctx,
+    'GET',
+    `/repos/${ctx.owner}/${ctx.repo}/commits/${encodeURIComponent(ctx.sha)}/check-runs` +
+      `?check_name=${encodeURIComponent(name)}&filter=all&per_page=100`
+  );
+  const sameName = (found?.check_runs || []).filter(Boolean);
+  // Newest first, because commits gated before this fix can already carry
+  // duplicates and GitHub takes the most recently updated one as the status
+  // context. Writing to any other would leave the required check on a stale value.
+  const owned = sameName
+    .filter((run) => run.external_id === externalId)
+    .sort((a, b) => String(b.started_at || '').localeCompare(String(a.started_at || '')) || (b.id || 0) - (a.id || 0))[0];
+  if (owned) return owned;
+
+  if (sameName.length > 0) {
+    const owners = [...new Set(sameName.map((run) => run.app?.slug || 'unknown'))].join(', ');
+    throw new Error(
+      `a check run named "${name}" on ${ctx.sha} was created by something else (${owners}). ` +
+        'Pick a different check-name; two writers on one name make the required status context flip between them.'
+    );
+  }
+  return null;
+}
+
+/**
+ * The body that invalidates a terminal verdict before it is recomputed.
  *
  * Without this step a write failure is fail-open: the previous verdict stays
- * published, so a gate that went green before a later failure merges. Moving the
- * context back to pending first means any failure from here on leaves the gate
+ * published, so a gate that went green before a later failure merges. Moving it
+ * back to in_progress first means any failure from here on leaves the gate
  * unconcluded, which blocks.
  */
+function invalidationCheckRun(name) {
+  return {
+    name,
+    status: 'in_progress',
+    title: 'Recomputing',
+    summary:
+      'A CI workflow finished, so the previous verdict no longer describes this commit. ' +
+      'The gate stays unconcluded until the new verdict is published, so a failure to ' +
+      'publish blocks the merge instead of leaving a stale result in place.',
+  };
+}
+
+/** The same invalidation, as a commit status. */
 function invalidationStatus(context) {
   return {
     context,
@@ -714,14 +816,62 @@ function invalidationStatus(context) {
 }
 
 /**
+ * Writes the verdict as a check run on the inspected commit, creating it when
+ * `existing` is null and updating it otherwise.
+ *
+ * The name is what the branch ruleset requires, so it must stay stable across
+ * updates. GitHub keeps only the most recently updated check run of a given name
+ * as the status context, which is what makes the update path safe.
+ */
+async function writeCheckRun(ctx, verdict, existing) {
+  const base = `/repos/${ctx.owner}/${ctx.repo}`;
+  const body = {
+    status: verdict.status,
+    output: { title: verdict.title, summary: verdict.summary },
+  };
+  if (verdict.status === 'completed') {
+    body.conclusion = verdict.conclusion;
+    body.completed_at = new Date().toISOString();
+  }
+
+  if (existing) {
+    // head_sha is not an accepted field on the update endpoint, and sending it
+    // is a 422. The SHA is already fixed by the check run being updated.
+    await rest(ctx, 'PATCH', `${base}/check-runs/${existing.id}`, body);
+    return { created: false, id: existing.id };
+  }
+
+  const created = await rest(
+    ctx,
+    'POST',
+    `${base}/check-runs`,
+    {
+      ...body,
+      name: verdict.name,
+      head_sha: ctx.sha,
+      external_id: externalIdFor(verdict.name),
+      started_at: new Date().toISOString(),
+    },
+    async () => findOwnedCheckRun(ctx, verdict.name)
+  );
+  return { created: true, id: created?.id };
+}
+
+/** Kept as the simple composition, for callers that write once. */
+async function upsertCheckRun(ctx, verdict) {
+  return writeCheckRun(ctx, verdict, await findOwnedCheckRun(ctx, verdict.name));
+}
+
+/**
  * Writes the verdict as a commit status on the inspected commit.
  *
  * No ownership lookup and no update path, because statuses supersede rather than
  * mutate: the most recently posted state for a context is the one a ruleset
- * reads. That also makes the write idempotent, so it needs no guard against a
- * lost response duplicating anything. The cost is that the commit accumulates a
- * status row per write, and GitHub allows 1000 per commit per context before it
- * starts rejecting them.
+ * reads. That also makes the write idempotent, so unlike the check-run create it
+ * needs no guard against a lost response duplicating anything. A normal event
+ * writes two rows: one pending invalidation and one verdict. GitHub allows 1000
+ * statuses per commit and context, so a single head SHA supports roughly 500
+ * events before another commit is needed.
  */
 async function writeCommitStatus(ctx, verdict, targetUrl) {
   await rest(ctx, 'POST', `/repos/${ctx.owner}/${ctx.repo}/statuses/${encodeURIComponent(ctx.sha)}`, {
@@ -751,14 +901,80 @@ function appendStepSummary(markdown) {
 }
 
 /**
- * Publishes a verdict, and puts its markdown where a reader can reach it.
+ * Watch mode's two publishing primitives, behind one interface so the flow that
+ * computes the verdict does not branch on the primitive at each of the four
+ * points where it writes.
  *
- * The status description is one 140-character line, so the detail goes to the
- * job summary, which is what `target_url` links to.
+ * `locate` reads whatever the primitive needs to write again, `prepare` also
+ * invalidates a terminal verdict first, and `write` publishes one.
+ *
+ * The reason there are two is presentation, not gating. A check run created
+ * through the Checks API with GITHUB_TOKEN belongs to the github-actions app, and
+ * so does every workflow run on the commit, each with its own check suite. An
+ * API-created check run cannot choose its suite, so GitHub files it in the first
+ * suite that app opened on the commit, which is whichever unrelated workflow
+ * happened to start first. The pull request page then labels the required check
+ * "<that workflow> / gate", so a failing gate reads as a failure of a workflow
+ * that passed. Observed across four pull requests on couture-cast, where the same
+ * gate was filed under three different workflows.
+ *
+ * A commit status belongs to no suite and no workflow, so it renders as `gate`
+ * and nothing else. It costs the markdown summary, which becomes a 140-character
+ * line plus a link to the job summary.
  */
-async function publishVerdict(ctx, verdict, targetUrl) {
-  appendStepSummary(`## ${verdict.title}\n\n${verdict.summary}\n`);
-  await writeCommitStatus(ctx, verdict, targetUrl);
+function checkRunPublisher(ctx, name) {
+  return {
+    label: 'check run',
+    verdictFor: (result, totalWatched) => verdictCheckRun(result, { name, totalWatched }),
+    bypassFor: (bypass) => bypassCheckRun(name, bypass),
+    describe: (verdict) =>
+      `${verdict.status}${verdict.conclusion ? `/${verdict.conclusion}` : ''}: ${verdict.title}`,
+    locate: () => findOwnedCheckRun(ctx, name),
+    async prepare() {
+      const existing = await findOwnedCheckRun(ctx, name);
+      if (existing && existing.status === 'completed') {
+        await writeCheckRun(ctx, invalidationCheckRun(name), existing);
+        log(`Invalidated the previous ${existing.conclusion} verdict before recomputing.`);
+      }
+      return existing;
+    },
+    async write(existing, verdict) {
+      const { created } = await writeCheckRun(ctx, verdict, existing);
+      return created ? 'Created' : 'Updated';
+    },
+  };
+}
+
+function commitStatusPublisher(ctx, context) {
+  const targetUrl = workflowRunUrl();
+  return {
+    label: 'commit status',
+    verdictFor: (result, totalWatched) => verdictStatus(result, { context, totalWatched }),
+    bypassFor: (bypass) => bypassStatus(context, bypass),
+    describe: (verdict) => `${verdict.state}: ${verdict.description}`,
+    // Nothing to read: there is no id to keep and no foreign owner to refuse,
+    // because a status has no external_id and posting one supersedes whatever
+    // held the context before.
+    locate: async () => null,
+    async prepare() {
+      // Posted unconditionally, where the check-run path only invalidates a
+      // verdict it found to be terminal. Reading the combined status first to
+      // make that same distinction would cost the call this write costs, and
+      // publishing pending regardless is the stronger version of the property:
+      // from here on, any failure leaves the context unfinished and blocking
+      // rather than leaving a stale green to merge on.
+      await writeCommitStatus(ctx, invalidationStatus(context), targetUrl);
+      log('Moved the context to pending before recomputing, so a failed write cannot leave a stale verdict.');
+      return null;
+    },
+    async write(_handle, verdict) {
+      // The markdown a check run carries as its summary has nowhere to go on a
+      // status. It goes to the job summary, which is what target_url points at.
+      appendStepSummary(`## ${verdict.title}\n\n${verdict.summary}\n`);
+      await writeCommitStatus(ctx, verdict, targetUrl);
+      return 'Published';
+    },
+  };
 }
 
 /**
@@ -792,6 +1008,7 @@ function buildOptions() {
   }
 
   const checkName = getInput('check-name') || 'gate';
+  const publish = parsePublish(getInput('publish'));
 
   const headBranch = resolveHeadBranch();
   const bypassPrefix = matchedBypassPrefix(headBranch, parseBypassPrefixes(getInput('bypass-branch-prefixes')));
@@ -810,6 +1027,7 @@ function buildOptions() {
     ctx,
     mode,
     checkName,
+    publish,
     headBranch,
     bypassPrefix,
     retryMethod,
@@ -823,9 +1041,10 @@ function buildOptions() {
       currentWorkflowFile: currentWorkflowFile(),
       skipSameWorkflow: getBooleanInput('skip-same-workflow'),
       skipList: parseSkipList(getInput('skip-list')),
-      // Watch mode used to publish a check run rather than a status, and a commit
-      // gated before that change can still carry one. Counting it as a sibling
-      // would leave the gate pending on its own abandoned verdict.
+      // Only watch mode has a check run of its own to collide with. Kept for
+      // `publish: status` too, where this commit can still carry one left behind
+      // by an earlier event that ran in check-run mode; counting that as a
+      // sibling would leave the gate pending on its own abandoned verdict.
       ownExternalId: mode === 'watch' ? externalIdFor(checkName) : '',
     },
   };
@@ -844,20 +1063,20 @@ function droppedReporter() {
 }
 
 /**
- * Reports a check run left on this commit by the version of watch mode that
- * published one instead of a status.
+ * Reports a check run this action published on this commit while it was still in
+ * `publish: check-run` mode.
  *
- * Only reachable on a commit gated before that change. The status now carries
- * the verdict and the check run is ignored as a sibling, but both hold the same
- * required context, so GitHub can still report the abandoned one and block a
- * merge the gate has already passed. Read off the check runs already fetched, so
- * detecting it costs no extra call.
+ * Only reachable mid-migration, on a commit that was gated before the input
+ * changed. The status now carries the verdict and that check run is ignored as a
+ * sibling, but both hold the same required context, so GitHub can still report
+ * the abandoned one and block a merge the gate has already passed. Read off the
+ * check runs already fetched, so detecting it costs no extra call.
  */
 function warnLeftoverCheckRun(all, ownExternalId, checkName) {
   if (!ownExternalId || !all.some((entry) => String(entry.externalId || '') === ownExternalId)) return;
   warn(
-    `This commit still carries a check run named "${checkName}", published by an older version of ` +
-      'this action. The commit status is the live verdict and that check run is ignored, but both ' +
+    `This commit still carries a check run named "${checkName}" from an earlier event that ran in ` +
+      'check-run mode. The commit status is the live verdict and that check run is ignored, but both ' +
       `claim the "${checkName}" context. If the merge stays blocked on a gate that reads green, push a ` +
       'new commit or conclude that check run by hand.'
   );
@@ -873,31 +1092,25 @@ function warnUnmatchedSkips(all, skipList) {
 
 /**
  * Watch mode: compute the verdict once from the current state of the commit and
- * publish it as a commit status, then exit. No waiting.
- *
- * A status rather than a check run because of how the pull request page labels
- * them. A check run created through the Checks API with GITHUB_TOKEN belongs to
- * the github-actions app, as does every workflow run on the commit, each with its
- * own check suite; an API-created check run cannot choose its suite, so GitHub
- * files it under whichever unrelated workflow opened the first one. The gate then
- * renders as "<that workflow> / gate", and a failing gate reads as a failure of a
- * workflow that passed. A status belongs to no suite, so it renders as `gate`.
+ * publish it as a check run, then exit. No waiting.
  *
  * The job's own exit code is deliberately not the verdict. The verdict lives in
- * the published status, which is what the branch ruleset requires, so this job
+ * the published check run, which is what the branch ruleset requires, so this job
  * stays green even when the gate is red.
  */
 async function runWatch(opts) {
-  const { ctx, checkName, headBranch, bypassPrefix, skipOpts, earlyExit, dryRun, warmupMs } = opts;
+  const { ctx, checkName, publish, headBranch, bypassPrefix, skipOpts, earlyExit, dryRun, warmupMs } = opts;
   const reportDropped = droppedReporter();
-  const targetUrl = workflowRunUrl();
+  const publisher = publish === 'status'
+    ? commitStatusPublisher(ctx, checkName)
+    : checkRunPublisher(ctx, checkName);
 
-  log(`Gate (watch) on ${ctx.owner}/${ctx.repo}@${ctx.sha}, publishing commit status "${checkName}"`);
+  log(`Gate (watch) on ${ctx.owner}/${ctx.repo}@${ctx.sha}, publishing ${publisher.label} "${checkName}"`);
   log(`  event: ${process.env.GITHUB_EVENT_NAME || '(unknown)'}, api retries: ${ctx.retryLimit}`);
   if (skipOpts.skipList.length > 0) log(`  skip-list: ${JSON.stringify(skipOpts.skipList)}`);
 
   if (bypassPrefix) {
-    const verdict = bypassStatus(checkName, { branch: headBranch, prefix: bypassPrefix });
+    const verdict = publisher.bypassFor({ branch: headBranch, prefix: bypassPrefix });
     setOutput('polls', '0');
     setOutput('conclusion', 'success');
     if (dryRun) {
@@ -908,7 +1121,7 @@ async function runWatch(opts) {
     // exists so a failed write cannot leave a stale green behind, and the target
     // here is green, so a failure leaves whatever was published before, which
     // blocks. Fails closed either way.
-    await publishVerdict(ctx, verdict, targetUrl);
+    await publisher.write(await publisher.locate(), verdict);
     notice(`Gate bypassed: ${headBranch} matches bypass-branch-prefixes entry "${bypassPrefix}". Published "${checkName}" as a pass without checking anything.`);
     return 0;
   }
@@ -920,16 +1133,7 @@ async function runWatch(opts) {
 
   // Invalidate before computing anything. Recomputing and only then discovering
   // the write fails is what leaves a stale green behind.
-  //
-  // Posted unconditionally rather than only when a terminal verdict is already
-  // published. Finding out which it is means reading the combined status, which
-  // costs the call this write costs, and moving the context to pending
-  // regardless is the stronger version of the property: from here on any failure
-  // leaves the gate unfinished and blocking.
-  if (!dryRun) {
-    await writeCommitStatus(ctx, invalidationStatus(checkName), targetUrl);
-    log('Moved the context to pending before recomputing, so a failed write cannot leave a stale verdict.');
-  }
+  const handle = dryRun ? null : await publisher.prepare();
 
   const seedEvent = ['pull_request', 'pull_request_target'].includes(process.env.GITHUB_EVENT_NAME);
   if (seedEvent && warmupMs > 0) {
@@ -953,21 +1157,21 @@ async function runWatch(opts) {
   log(`${watched.length} watched check run(s) of ${all.length} total.`);
   for (const entry of watched) log(`  ${formatEntry(entry)}`);
   if (all.length > 0) warnUnmatchedSkips(all, skipOpts.skipList);
-  warnLeftoverCheckRun(all, skipOpts.ownExternalId, checkName);
+  if (publish === 'status') warnLeftoverCheckRun(all, skipOpts.ownExternalId, checkName);
 
   const result = evaluate(watched, { earlyExit });
-  const verdict = verdictStatus(result, { context: checkName, totalWatched: watched.length });
+  const verdict = publisher.verdictFor(result, watched.length);
 
   setOutput('polls', '1');
   setOutput('conclusion', result.done ? (result.ok ? 'success' : 'failure') : 'pending');
 
   if (dryRun) {
-    warn(`dry-run: would have set commit status "${checkName}" to ${verdict.state} — ${verdict.description}`);
+    warn(`dry-run: would have set ${publisher.label} "${checkName}" to ${publisher.describe(verdict)}`);
     return 0;
   }
 
-  await publishVerdict(ctx, verdict, targetUrl);
-  log(`Published commit status "${checkName}": ${verdict.state} — ${verdict.description}`);
+  const note = await publisher.write(handle, verdict);
+  log(`${note} ${publisher.label} "${checkName}": ${publisher.describe(verdict)}`);
   return 0;
 }
 
@@ -1073,6 +1277,7 @@ module.exports = {
   parseDurationSeconds,
   classify,
   parseMode,
+  parsePublish,
   parseSkipList,
   currentWorkflowFile,
   shouldSkip,
@@ -1089,18 +1294,25 @@ module.exports = {
   formatEntry,
   codeSpan,
   plainText,
+  verdictCheckRun,
   verdictStatus,
+  statusState,
   statusDescription,
   truncateForStatus,
   resolveHeadBranch,
   parseBypassPrefixes,
   matchedBypassPrefix,
+  bypassCheckRun,
   bypassStatus,
   externalIdFor,
+  findOwnedCheckRun,
+  writeCheckRun,
   writeCommitStatus,
+  invalidationCheckRun,
   invalidationStatus,
   workflowRunUrl,
   resolveSha,
   graphql,
   rest,
+  upsertCheckRun,
 };

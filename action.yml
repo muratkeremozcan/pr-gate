@@ -25,8 +25,9 @@ description: |
 
   Two modes. `wait` blocks a job until the siblings finish, which is simple but
   occupies a runner for as long as the slowest job. `watch` recomputes the
-  verdict on each CI completion event and publishes it as a commit status,
-  costing seconds per event instead of minutes of idling.
+  verdict on each CI completion event and publishes it as a check run, or as a
+  commit status with `publish: status`, costing seconds per event instead of
+  minutes of idling.
 
   Copy-paste workflows for both modes are in pr-gate/README.md. They are not
   repeated here, because Actions evaluates expression syntax anywhere in this file
@@ -42,19 +43,47 @@ inputs:
 
       'wait' occupies this job until every sibling check run finishes, then sets
       the job's own exit code. 'watch' computes the verdict once from the current
-      state of the commit, publishes it as the commit status named by check-name,
-      and exits immediately. Watch mode needs `statuses: write` and is meant to be
-      driven by workflow_run completion events.
+      state of the commit, publishes it using the primitive selected by publish,
+      and exits immediately. Watch mode is meant to be driven by workflow_run
+      completion events.
     required: true
   check-name:
     description: |
-      Watch mode only. Context of the published commit status, which is the status
-      context a branch ruleset requires. Must stay stable, and must not collide
-      with the name of the job running this action.
+      Watch mode only. Name of the published check run or commit status, which is
+      also the status context a branch ruleset requires. Must stay stable, and
+      must not collide with the name of the job running this action.
     required: false
     default: 'gate'
+  publish:
+    description: |
+      Watch mode only. Which primitive carries the verdict: 'check-run' (default)
+      or 'status'. Both satisfy a ruleset requiring the same context name, so
+      switching needs no ruleset edit.
+
+      The compatibility default is 'check-run'. Existing consumers can upgrade
+      without changing their `checks: write` permission. New configurations can
+      select 'status' explicitly for a stable, ungrouped label on the pull request.
+
+      'check-run' needs `checks: write`, and gives a markdown summary on the
+      check's own page. Its cost is the label. A check run created through the
+      Checks API with GITHUB_TOKEN belongs to the github-actions app, and so does
+      every workflow run on the commit, each with its own check suite. An
+      API-created check run cannot choose its suite, so GitHub files it in the
+      first suite that app opened on the commit, which is whichever unrelated
+      workflow started first. The pull request page then labels the required check
+      "<that workflow> / gate", and a failing gate reads as a failure of a
+      workflow that passed.
+
+      'status' needs `statuses: write` instead, and belongs to no suite and no
+      workflow, so it renders as the context name alone and its description names
+      the jobs that failed. Its cost is the summary: a status description holds
+      140 characters, so the markdown goes to the job summary and target_url
+      links to it. Each normal event writes two status rows. GitHub accepts 1000
+      rows per commit and context.
+    required: false
+    default: 'check-run'
   github-token:
-    description: 'Token used for the GitHub API. Needs read access to checks and actions; watch mode also needs statuses: write to publish the verdict.'
+    description: 'Token used for the GitHub API. Needs read access to checks and actions; watch mode also needs checks: write to publish the verdict, or statuses: write when publish is status.'
     required: false
     default: '${{ github.token }}'
   github-api-url:
@@ -112,12 +141,12 @@ inputs:
     description: |
       Comma separated branch prefixes that wave the gate through, e.g.
       'hotfix/,emergency/'. The gate publishes a pass without reading any other
-      check run, and the summary says which prefix matched.
+      verdict, and the summary says which prefix matched.
 
       This exists because watch mode cannot use a skipped job as its escape
       hatch. In wait mode the required check is the job and GitHub counts a
       skipped job as passing, so an `if:` guard works. In watch mode the required
-      check is the published status, so a skipped job writes nothing, the context
+      check is the published verdict, so a skipped job writes nothing, the context
       never appears, and the merge blocks on a check that is never coming. The
       hatch has to run and publish a pass instead.
 
