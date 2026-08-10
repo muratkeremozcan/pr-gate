@@ -56,15 +56,27 @@ const notice = (msg) => log(`::notice::${msg}`);
 
 // ─── pure logic, exported for tests ───────────────────────────────────────────
 
-/** Accepts ISO 8601 (`PT1M30S`) or plain seconds (`90`). */
+const SHORT_UNIT_SECONDS = { s: 1, m: 60, h: 3600, d: 86400 };
+
+/**
+ * Accepts `20m`, ISO 8601 (`PT1M30S`) or plain seconds (`90`).
+ *
+ * ISO 8601 and plain seconds are what kachick/wait-other-jobs takes, and matching
+ * it is what makes migrating a caller a one-line change to `uses:`. The short
+ * form is here because `PT20M` in a workflow file is unreadable to anyone who has
+ * not met ISO 8601 durations, and a timeout nobody can read is a timeout nobody
+ * checks. One unit only; anything compound goes through ISO.
+ */
 function parseDurationSeconds(raw, fallbackSeconds) {
   const s = String(raw == null ? '' : raw).trim();
   if (s === '') return fallbackSeconds;
   if (/^\d+(?:\.\d+)?$/.test(s)) return Number(s);
+  const short = /^(\d+(?:\.\d+)?)([smhd])$/i.exec(s);
+  if (short) return Number(short[1]) * SHORT_UNIT_SECONDS[short[2].toLowerCase()];
   const m = /^P(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$/i
     .exec(s);
   if (!m || (m[1] === undefined && m[2] === undefined && m[3] === undefined && m[4] === undefined)) {
-    throw new Error(`invalid duration "${raw}", use ISO 8601 like PT15S or plain seconds like 15`);
+    throw new Error(`invalid duration "${raw}", use 20m, PT20M or plain seconds like 1200`);
   }
   const total = Number(m[1] || 0) * 86400 + Number(m[2] || 0) * 3600 +
     Number(m[3] || 0) * 60 + Number(m[4] || 0);

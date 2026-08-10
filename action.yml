@@ -20,8 +20,8 @@ description: |
       the runtime's global fetch against the GraphQL API.
 
   Input names and formats match kachick/wait-other-jobs so migrating a caller is
-  a one-line change to `uses:`. Durations accept ISO 8601 (`PT15S`) or plain
-  seconds (`15`).
+  a one-line change to `uses:`. Durations accept a short form (`20m`, `2h`,
+  `30s`), plain seconds (`1200`), or ISO 8601 (`PT20M`).
 
   Two modes. `wait` blocks a job until the siblings finish, which is simple but
   occupies a runner for as long as the slowest job. `watch` recomputes the
@@ -102,11 +102,11 @@ inputs:
   warmup-delay:
     description: |
       Wait this long before the first poll, so sibling jobs have had a chance to
-      register their check runs. ISO 8601 duration or plain seconds.
+      register their check runs. `20m`, plain seconds, or ISO 8601.
     required: false
     default: 'PT10S'
   minimum-interval:
-    description: 'Minimum wait between polls. ISO 8601 duration or plain seconds.'
+    description: 'Minimum wait between polls. Accepts `20m`, plain seconds, or ISO 8601.'
     required: false
     default: 'PT15S'
   retry-method:
@@ -131,7 +131,7 @@ inputs:
     required: false
     default: '5'
   api-retry-base-delay:
-    description: 'Base delay for API retry backoff, doubled per attempt with jitter. ISO 8601 duration or plain seconds.'
+    description: 'Base delay for API retry backoff, doubled per attempt with jitter. Accepts `20m`, plain seconds, or ISO 8601.'
     required: false
     default: 'PT2S'
   skip-same-workflow:
@@ -182,7 +182,7 @@ inputs:
   wait-for-timeout:
     description: |
       How long the commit may go quiet with a wait-for rule still unmatched
-      before the gate stops waiting. ISO 8601 duration or plain seconds.
+      before the gate stops waiting. Accepts `20m`, plain seconds, or ISO 8601.
 
       "Quiet" is the operative word. The clock runs from the newest check suite
       on the commit, so every workflow that starts pushes the deadline out and it

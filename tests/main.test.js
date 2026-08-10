@@ -24,6 +24,11 @@ describe('parseDurationSeconds', () => {
     ['15', 15, 'plain seconds, so callers do not have to learn ISO 8601'],
     ['0', 0],
     ['2.5', 2.5],
+    ['20m', 1200, 'the readable form, since PT20M in a workflow file explains nothing'],
+    ['15s', 15],
+    ['2h', 7200],
+    ['1D', 86400, 'case insensitive here too'],
+    ['1.5m', 90],
   ];
   for (const [input, expected, why] of cases) {
     test(`${JSON.stringify(input)} -> ${expected}${why ? ` (${why})` : ''}`, () => {
@@ -36,7 +41,9 @@ describe('parseDurationSeconds', () => {
     assert.strictEqual(gate.parseDurationSeconds(undefined, 15), 15);
   });
 
-  for (const bad of ['PT', 'P', 'abc', '15s', 'PT15X', '-5']) {
+  // '1h30m' is deliberately rejected. One unit or ISO 8601, so there is no half
+  // grammar for a reader to guess at.
+  for (const bad of ['PT', 'P', 'abc', 'PT15X', '-5', '15x', '1h30m', 'm', '15 m']) {
     test(`rejects ${JSON.stringify(bad)} instead of silently defaulting`, () => {
       assert.throws(() => gate.parseDurationSeconds(bad, 15), /invalid duration/);
     });
