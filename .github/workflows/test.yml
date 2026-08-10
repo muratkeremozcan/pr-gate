@@ -156,9 +156,15 @@ jobs:
           RULE: '[{"workflowFile":"no-such-workflow.yml"}]'
         run: |
           set -o pipefail
+          # Every input is spelled out because this runs main.js directly rather
+          # than through `uses:`, and the runner only applies action.yml defaults
+          # to an action it resolved. Left implicit, skip-same-workflow reads as
+          # false, the gate watches the job it is running in, and the run never
+          # concludes.
           common() {
             env INPUT_MODE=wait "INPUT_GITHUB-TOKEN=$TOKEN" INPUT_REF="$SHA" \
                 INPUT_DRY-RUN=true INPUT_ATTEMPT-LIMITS=1 INPUT_WARMUP-DELAY=0 \
+                INPUT_SKIP-SAME-WORKFLOW=true INPUT_EARLY-EXIT=true \
                 INPUT_WAIT-FOR="$RULE" "$@" node main.js
           }
 
