@@ -60,6 +60,12 @@ trigger starts working after this workflow exists on the default branch.
 
 ## Re-running a failed job
 
+This section and the next describe two independent, optional features. Neither is
+required and neither needs the other. `in_progress` is a trigger edit in your own
+workflow; `wait-for` is an action input that defaults to doing nothing. An
+existing caller that adopts neither behaves exactly as it did before.
+
+
 Nobody has to re-run the gate. A re-run of any workflow on the commit wakes it
 by itself, and the verdict is recomputed from the state of the commit rather
 than remembered from the last one.
