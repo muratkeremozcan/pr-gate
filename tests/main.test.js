@@ -1893,12 +1893,16 @@ describe('lingering does not duplicate the required check run', () => {
     const created = [];
     let owned = [];
     let reads = 0;
+    // Fixed, not regenerated per read. A timestamp built inside the stub moves
+    // the anchor forward on every look, so the deadline recedes and the loop
+    // runs to attempt-limits instead of converging.
+    const suiteCreatedAt = new Date(Date.now() - 100).toISOString();
     global.fetch = async (url, init) => {
       const target = String(url);
       if (target.endsWith('/graphql')) {
         reads += 1;
         return res({ data: { repository: { object: { checkSuites: { pageInfo: { hasNextPage: false }, nodes: [{
-          id: 'S', createdAt: new Date(Date.now() - 100).toISOString(),
+          id: 'S', createdAt: suiteCreatedAt,
           workflowRun: { databaseId: 1, workflow: { name: 'CI', resourcePath: '/o/r/actions/workflows/ci.yml' } },
           checkRuns: { totalCount: 1, pageInfo: { hasNextPage: false }, nodes: [
             { name: 'unit', status: 'COMPLETED', conclusion: 'SUCCESS', detailsUrl: 'u', externalId: '', startedAt: '2026-08-10T11:00:00Z' },
@@ -1937,5 +1941,54 @@ describe('lingering does not duplicate the required check run', () => {
 
     assert.strictEqual(created.length, 1, 'created the check run once, then updated it');
     assert.ok(reads >= 2, 'looked again after the wait');
+  });
+});
+
+describe('the linger cannot busy-loop against the API', () => {
+  const originalFetch = global.fetch;
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  test('a deadline that keeps receding is still bounded by the poll interval', async () => {
+    // Found by watching the poll log: "0s left" repeating. The loop had captured
+    // the deadline once while assessment() recomputed it, so an anchor that moved
+    // left the loop sleeping zero and re-reading the API as fast as it could for
+    // the whole of attempt-limits. Nothing in production moves the anchor, which
+    // is exactly why the floor has to be in the loop rather than in the anchor.
+    const res = (body) => ({
+      ok: true, status: 200, headers: new Headers(),
+      json: async () => body, text: async () => JSON.stringify(body),
+    });
+    let reads = 0;
+    global.fetch = async (url, init) => {
+      if (String(url).endsWith('/graphql')) {
+        reads += 1;
+        // A fresh timestamp per read, so the deadline never arrives.
+        return res({ data: { repository: { object: { checkSuites: { pageInfo: { hasNextPage: false }, nodes: [{
+          id: 'S', createdAt: new Date(Date.now() - 10).toISOString(),
+          workflowRun: { databaseId: 1, workflow: { name: 'CI', resourcePath: '/o/r/actions/workflows/ci.yml' } },
+          checkRuns: { totalCount: 1, pageInfo: { hasNextPage: false }, nodes: [
+            { name: 'unit', status: 'COMPLETED', conclusion: 'SUCCESS', detailsUrl: 'u', externalId: '', startedAt: '2026-08-10T11:00:00Z' },
+          ] },
+        }] } } } } });
+      }
+      return res({ id: 1 });
+    };
+
+    const startedAt = Date.now();
+    await gate.runWatch({
+      ctx: { apiUrl: 'https://api.github.invalid', token: 't', owner: 'o', repo: 'r', sha: 'sha1', retryLimit: 0, baseDelayMs: 0 },
+      checkName: 'gate', publish: 'status', headBranch: 'f', bypassPrefix: null,
+      skipOpts: { skipSameWorkflow: false, skipList: [], ownExternalId: '' },
+      earlyExit: true, dryRun: false, warmupMs: 0, minimumMs: 60_000,
+      // Three polls of a one-second floor, not three hundred of none.
+      attemptLimits: 3, retryMethod: 'equal_intervals',
+      waitFor: [{ workflowFile: 'e2e.yml' }], waitForTimeoutSec: 1,
+      timeoutConclusion: 'failure', rerun: null,
+    });
+
+    assert.strictEqual(reads, 3, 'one read per poll, bounded by attempt-limits');
+    assert.ok(Date.now() - startedAt >= 1900, 'each poll waited the floor rather than spinning');
   });
 });

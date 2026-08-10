@@ -1321,13 +1321,17 @@ function warnConflictingWaitFor(all, skipOpts, waitFor) {
  */
 function assessment(all, { skipOpts, rerun, waitFor, waitForTimeoutSec, timeoutConclusion, earlyExit }, nowMs = Date.now()) {
   const watched = markRerunning(all.filter((entry) => !shouldSkip(entry, skipOpts)), rerun);
+  const deadlineMs = waitForDeadlineMs(all, waitForTimeoutSec);
   const { entries: expected, waived } = waitForEntries(watched, waitFor, {
-    deadlineMs: waitForDeadlineMs(all, waitForTimeoutSec),
+    deadlineMs,
     nowMs,
     timeoutConclusion,
   });
   const entries = [...watched, ...expected];
-  return { all, watched, entries, waived, result: evaluate(entries, { earlyExit }) };
+  // The deadline is returned rather than recomputed by the caller. It decides
+  // `expired` here, so a caller holding its own copy could sleep against one
+  // deadline while the loop exits on another.
+  return { all, watched, entries, waived, deadlineMs, result: evaluate(entries, { earlyExit }) };
 }
 
 /**
@@ -1438,21 +1442,29 @@ async function runWatch(opts) {
     // posting one supersedes whatever held the context before.
     handle = await publisher.locate();
 
-    const deadlineMs = waitForDeadlineMs(state.all, waitForTimeoutSec);
     while (awaitingArrivalOnly(state.result) && polls < attemptLimits) {
       // A null deadline means no check suite has been created on this commit at
       // all, so the clock the timeout is measured from has not started. Holding
       // the runner against a deadline that cannot arrive would burn the job's
       // timeout and publish nothing.
-      if (deadlineMs == null) break;
-      // Never break on an elapsed deadline without looking again first. The state
-      // in hand was read before the deadline, so it still says "waiting", and
+      if (state.deadlineMs == null) break;
+      // Read off the last assessment, not captured once before the loop. The
+      // assessment is what decides whether the deadline has passed, so a
+      // separate copy here could sleep against one deadline while the loop exits
+      // on another.
+      //
+      // Never break on an elapsed deadline without looking again first: the state
+      // in hand was read before it passed, so it still says "waiting", and
       // publishing that would leave the gate pending on a timeout that has
-      // already run out, with no event left to come and notice.
-      await sleep(Math.max(0, Math.min(minimumMs, deadlineMs - Date.now())));
+      // already run out with no event left to come and notice. The floor is what
+      // makes that safe to say. Sleeping the exact remainder would busy-loop
+      // against the API for the rest of attempt-limits if the two ever disagreed,
+      // and a second is nothing against a timeout measured in minutes.
+      const remainingMs = state.deadlineMs - Date.now();
+      await sleep(Math.max(1000, Math.min(minimumMs, remainingMs)));
       polls += 1;
       state = await assess();
-      log(`Poll ${polls}: ${Math.round(Math.max(0, deadlineMs - Date.now()) / 1000)}s left on wait-for-timeout.`);
+      log(`Poll ${polls}: ${Math.round(Math.max(0, state.deadlineMs - Date.now()) / 1000)}s left on wait-for-timeout.`);
     }
     for (const entry of state.entries) log(`  ${formatEntry(entry)}`);
   }
