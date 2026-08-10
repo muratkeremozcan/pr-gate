@@ -1447,7 +1447,7 @@ describe('getInput', () => {
 
 // ─── re-running a failed job ─────────────────────────────────────────────────
 
-describe('rerunningWorkflowRun', () => {
+describe('triggeringWorkflowRun', () => {
   const fs = require('node:fs');
   const os = require('node:os');
   const path = require('node:path');
@@ -1457,85 +1457,131 @@ describe('rerunningWorkflowRun', () => {
     fs.writeFileSync(file, JSON.stringify(body));
     return file;
   };
+  const read = (body, name = 'workflow_run') =>
+    gate.triggeringWorkflowRun({ GITHUB_EVENT_NAME: name, GITHUB_EVENT_PATH: payload(body) });
 
-  const rerun = {
-    action: 'in_progress',
-    workflow_run: { id: 31385709364, run_attempt: 2, run_started_at: '2026-08-10T11:58:10Z' },
-  };
+  const run = { id: 31385709364, run_attempt: 2, run_started_at: '2026-08-10T11:58:10Z', name: 'CI', path: '.github/workflows/ci.yml' };
 
-  test('an in_progress event for a second attempt is a re-run', () => {
+  test('an in_progress event reports an unfinished run', () => {
     // Measured against the API: "re-run failed jobs" produced exactly this, six
     // seconds after the click, and no `requested` event at all.
-    const found = gate.rerunningWorkflowRun({
-      GITHUB_EVENT_NAME: 'workflow_run',
-      GITHUB_EVENT_PATH: payload(rerun),
-    });
+    const found = read({ action: 'in_progress', workflow_run: run });
     assert.strictEqual(found.runId, '31385709364');
     assert.strictEqual(found.attempt, 2);
+    assert.strictEqual(found.finished, false);
     assert.strictEqual(found.startedAtMs, Date.parse('2026-08-10T11:58:10Z'));
   });
 
-  test('a first attempt is not a re-run, so nothing is suppressed', () => {
-    const first = { ...rerun, workflow_run: { ...rerun.workflow_run, run_attempt: 1 } };
-    assert.strictEqual(
-      gate.rerunningWorkflowRun({ GITHUB_EVENT_NAME: 'workflow_run', GITHUB_EVENT_PATH: payload(first) }),
-      null
-    );
+  test('a first attempt is read too, because its jobs are equally invisible', () => {
+    // The earlier version ignored attempt 1 as uninteresting. It is not: the run
+    // has no check runs yet, so any older passing job on the commit makes the
+    // whole thing read as finished.
+    const found = read({ action: 'in_progress', workflow_run: { ...run, run_attempt: 1 } });
+    assert.strictEqual(found.finished, false);
+    assert.strictEqual(found.attempt, 1);
   });
 
-  test('a completed event is not a re-run even at attempt 2', () => {
-    // By then the new attempt has its own conclusion, and suppressing it would
-    // hide a genuine failure of the re-run.
-    const done = { ...rerun, action: 'completed' };
-    assert.strictEqual(
-      gate.rerunningWorkflowRun({ GITHUB_EVENT_NAME: 'workflow_run', GITHUB_EVENT_PATH: payload(done) }),
-      null
-    );
+  test('a completed event carries the conclusion the check runs may not show yet', () => {
+    const found = read({ action: 'completed', workflow_run: { ...run, conclusion: 'FAILURE' } });
+    assert.strictEqual(found.finished, true);
+    assert.strictEqual(found.conclusion, 'failure');
   });
 
-  test('other event types and missing payloads are not re-runs', () => {
-    assert.strictEqual(
-      gate.rerunningWorkflowRun({ GITHUB_EVENT_NAME: 'pull_request', GITHUB_EVENT_PATH: payload(rerun) }),
-      null
-    );
-    assert.strictEqual(gate.rerunningWorkflowRun({ GITHUB_EVENT_NAME: 'workflow_run' }), null);
+  test('other event types and missing payloads report nothing', () => {
+    assert.strictEqual(read({ action: 'in_progress', workflow_run: run }, 'pull_request'), null);
+    assert.strictEqual(gate.triggeringWorkflowRun({ GITHUB_EVENT_NAME: 'workflow_run' }), null);
   });
 });
 
-describe('markRerunning', () => {
-  const rerun = { runId: '7', attempt: 2, startedAtMs: Date.parse('2026-08-10T11:58:10Z') };
-  const failed = {
-    name: 'quality-gate', workflowRunId: 7, workflowName: 'PR checks',
-    status: 'COMPLETED', conclusion: 'FAILURE', startedAt: '2026-08-10T11:20:24Z',
+describe('the run that woke the gate cannot be read as finished', () => {
+  const ok = {
+    name: 'unit', workflowName: 'CI', workflowPath: '/o/r/actions/workflows/ci.yml',
+    workflowRunId: 7, status: 'COMPLETED', conclusion: 'SUCCESS', startedAt: '2026-08-10T11:20:24Z',
+  };
+  const inFlight = {
+    runId: '7', attempt: 2, startedAtMs: Date.parse('2026-08-10T11:58:10Z'),
+    finished: false, conclusion: '', workflowName: 'CI', workflowPath: '.github/workflows/ci.yml',
   };
 
-  test('the previous attempt\'s failure reads as re-running, not as a failure', () => {
+  test("the previous attempt's failure reads as re-running", () => {
     // Without this the gate republishes the red the re-run exists to clear, which
     // is what teaches people to go and re-run the gate by hand.
-    const [entry] = gate.markRerunning([failed], rerun);
+    const [entry] = gate.markInFlight([{ ...ok, conclusion: 'FAILURE' }], inFlight);
     assert.strictEqual(gate.classify(entry), 'pending');
     assert.match(gate.formatEntry(entry), /re-running/);
   });
 
-  test('a job that succeeded in the previous attempt keeps its result', () => {
-    // "Re-run failed jobs" carries the passing jobs forward untouched, so their
-    // check runs are current and re-reporting them as pending would stall the gate.
-    const passed = { ...failed, conclusion: 'SUCCESS' };
-    assert.deepStrictEqual(gate.markRerunning([passed], rerun), [passed]);
+  test("the previous attempt's success reads as re-running too", () => {
+    // "Re-run all jobs" leaves attempt 1's successes as the newest check runs, so
+    // trusting them publishes a pass for a run that is still going and may fail.
+    const [entry] = gate.markInFlight([ok], inFlight);
+    assert.strictEqual(gate.classify(entry), 'pending');
   });
 
-  test('a failure stamped after this attempt began belongs to this attempt', () => {
-    const fresh = { ...failed, startedAt: '2026-08-10T11:58:13Z' };
-    assert.deepStrictEqual(gate.markRerunning([fresh], rerun), [fresh]);
+  test('a check run proven to belong to this attempt keeps its result', () => {
+    const fresh = { ...ok, startedAt: '2026-08-10T11:58:13Z' };
+    assert.deepStrictEqual(gate.markInFlight([fresh], inFlight), [fresh]);
+  });
+
+  test('a check run with no usable timestamp is held pending, not trusted', () => {
+    // CheckRun.startedAt is nullable. Pending only ever blocks a merge, so the
+    // unproven case costs an event of latency and cannot pass a bad commit.
+    const [entry] = gate.markInFlight([{ ...ok, startedAt: '' }], inFlight);
+    assert.strictEqual(gate.classify(entry), 'pending');
   });
 
   test('other workflow runs on the commit are untouched', () => {
-    const other = { ...failed, workflowRunId: 8 };
-    assert.deepStrictEqual(gate.markRerunning([other], rerun), [other]);
+    const other = { ...ok, workflowRunId: 8 };
+    assert.deepStrictEqual(gate.markInFlight([other], inFlight), [other]);
   });
 
-  test('no re-run means no rewriting at all', () => {
-    assert.deepStrictEqual(gate.markRerunning([failed], null), [failed]);
+  test('an invisible run is projected, so an older success cannot carry the verdict', () => {
+    // The event says work started. The snapshot shows one unrelated job that
+    // passed. Read literally that is a finished, green commit.
+    const older = { ...ok, workflowRunId: 9 };
+    const bare = gate.assessment([older], {
+      skipOpts: { skipSameWorkflow: false, skipList: [] }, triggeringRun: null,
+      waitFor: [], waitForTimeoutSec: 600, timeoutConclusion: 'failure', earlyExit: true,
+    });
+    assert.deepStrictEqual([bare.result.done, bare.result.ok], [true, true], 'green without the projection');
+
+    const guarded = gate.assessment([older], {
+      skipOpts: { skipSameWorkflow: false, skipList: [] }, triggeringRun: inFlight,
+      waitFor: [], waitForTimeoutSec: 600, timeoutConclusion: 'failure', earlyExit: true,
+    });
+    assert.strictEqual(guarded.result.done, false, 'the run that just started is pending');
+    assert.strictEqual(guarded.result.pending[0].projected, true);
+  });
+
+  test('a projected run still obeys skip-list', () => {
+    // Waiting on a run the caller explicitly told the gate to ignore would be a
+    // worse bug than the one the projection fixes.
+    const guarded = gate.assessment([{ ...ok, workflowRunId: 9 }], {
+      skipOpts: { skipSameWorkflow: false, skipList: [{ workflowFile: 'ci.yml' }] },
+      triggeringRun: inFlight, waitFor: [], waitForTimeoutSec: 600,
+      timeoutConclusion: 'failure', earlyExit: true,
+    });
+    assert.strictEqual(guarded.result.done, true);
+  });
+
+  test('a completed run that did not pass is failed even if its checks still read green', () => {
+    // The event is the authority on its own run. A stale attempt-1 success must
+    // not outvote a failed attempt-2 completion.
+    const finished = { ...inFlight, finished: true, conclusion: 'failure' };
+    const guarded = gate.assessment([ok], {
+      skipOpts: { skipSameWorkflow: false, skipList: [] }, triggeringRun: finished,
+      waitFor: [], waitForTimeoutSec: 600, timeoutConclusion: 'failure', earlyExit: true,
+    });
+    assert.deepStrictEqual([guarded.result.done, guarded.result.ok], [true, false]);
+  });
+
+  test('a completed run that passed adds nothing', () => {
+    const finished = { ...inFlight, finished: true, conclusion: 'success' };
+    assert.deepStrictEqual(gate.withTriggeringRun([ok], finished), [ok]);
+  });
+
+  test('no triggering run means no rewriting at all', () => {
+    assert.deepStrictEqual(gate.withTriggeringRun([ok], null), [ok]);
   });
 });
 
@@ -1645,7 +1691,7 @@ describe('assessment: wait-for holds a gate that would otherwise pass', () => {
   };
   const opts = {
     skipOpts: { skipSameWorkflow: false, skipList: [] },
-    rerun: null,
+    triggeringRun: null,
     waitFor: [{ workflowFile: 'e2e.yml' }],
     waitForTimeoutSec: 600,
     timeoutConclusion: 'failure',
@@ -1810,7 +1856,7 @@ describe('watch mode holds its runner only for a job that has not started', () =
     waitFor: [{ workflowFile: 'e2e.yml' }],
     waitForTimeoutSec: 1,
     timeoutConclusion: 'failure',
-    rerun: null,
+    triggeringRun: null,
     ...over,
   });
 
@@ -1937,7 +1983,7 @@ describe('lingering does not duplicate the required check run', () => {
       waitFor: [{ workflowFile: 'e2e.yml' }],
       waitForTimeoutSec: 1,
       timeoutConclusion: 'failure',
-      rerun: null,
+      triggeringRun: null,
     });
 
     assert.strictEqual(created.length, 1, 'created the check run once, then updated it by carried id');
@@ -1986,10 +2032,73 @@ describe('the linger cannot busy-loop against the API', () => {
       // Three polls of a one-second floor, not three hundred of none.
       attemptLimits: 3, retryMethod: 'equal_intervals',
       waitFor: [{ workflowFile: 'e2e.yml' }], waitForTimeoutSec: 1,
-      timeoutConclusion: 'failure', rerun: null,
+      timeoutConclusion: 'failure', triggeringRun: null,
     });
 
     assert.strictEqual(reads, 3, 'one read per poll, bounded by attempt-limits');
     assert.ok(Date.now() - startedAt >= 1900, 'each poll waited the floor rather than spinning');
+  });
+});
+
+describe('wait-for rules cannot be discharged by a type-invalid match', () => {
+  test('a non-string jobName is rejected instead of matching everything', () => {
+    // `[].startsWith` is never reached: String([]) is "", so a prefix rule
+    // matches every check run on the commit. In skip-list that ignores
+    // everything; in wait-for the rule is discharged by the first unrelated job
+    // and a green verdict follows without the job it was told to wait for.
+    assert.throws(
+      () => gate.parseWaitFor('[{"jobName":[],"jobMatchMode":"prefix"}]'),
+      /jobName must be a non-empty string/
+    );
+    assert.throws(() => gate.parseSkipList('[{"workflowFile":123}]'), /workflowFile must be a non-empty string/);
+    assert.throws(() => gate.parseWaitFor('[{"jobName":"   "}]'), /jobName must be a non-empty string/);
+  });
+
+  test('the empty-string rule that used to match everything no longer parses', () => {
+    assert.throws(() => gate.parseWaitFor('[{"workflowFile":""}]'), /needs workflowFile, jobName, or both/);
+  });
+});
+
+describe('the linger concludes rather than parking the gate pending forever', () => {
+  const originalFetch = global.fetch;
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  test('running out of polls before the deadline is a failure that names the knob', () => {
+    // awaitingArrivalOnly means nothing is coming to recompute this. Publishing
+    // pending would block the pull request on a timeout that is never evaluated.
+    const res = (b) => ({ ok: true, status: 200, headers: new Headers(), json: async () => b, text: async () => JSON.stringify(b) });
+    const posted = [];
+    const createdAt = new Date().toISOString();
+    global.fetch = async (url, init) => {
+      if (String(url).endsWith('/graphql')) {
+        return res({ data: { repository: { object: { checkSuites: { pageInfo: { hasNextPage: false }, nodes: [{
+          id: 'S', createdAt,
+          workflowRun: { databaseId: 1, workflow: { name: 'CI', resourcePath: '/o/r/actions/workflows/ci.yml' } },
+          checkRuns: { totalCount: 1, pageInfo: { hasNextPage: false }, nodes: [
+            { name: 'unit', status: 'COMPLETED', conclusion: 'SUCCESS', detailsUrl: 'u', externalId: '', startedAt: createdAt },
+          ] },
+        }] } } } } });
+      }
+      posted.push(JSON.parse(init.body));
+      return res({ id: 1 });
+    };
+
+    return gate.runWatch({
+      ctx: { apiUrl: 'https://api.github.invalid', token: 't', owner: 'o', repo: 'r', sha: 's', retryLimit: 0, baseDelayMs: 0 },
+      checkName: 'gate', publish: 'status', headBranch: 'f', bypassPrefix: null,
+      skipOpts: { skipSameWorkflow: false, skipList: [], ownExternalId: '' },
+      earlyExit: true, dryRun: false, warmupMs: 0, minimumMs: 1000,
+      // A poll budget far too small for the timeout, which is the misconfiguration
+      // that used to end in a permanently pending required check.
+      attemptLimits: 2, retryMethod: 'equal_intervals',
+      waitFor: [{ workflowFile: 'e2e.yml' }], waitForTimeoutSec: 86_400,
+      timeoutConclusion: 'failure', triggeringRun: null,
+    }).then(() => {
+      const last = posted[posted.length - 1];
+      assert.strictEqual(last.state, 'failure');
+      assert.match(last.description, /never started/);
+    });
   });
 });

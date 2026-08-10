@@ -111,27 +111,63 @@ function classify(entry) {
 }
 
 /**
- * Reports the previous attempt's failures as re-running, for the workflow run
- * that is being re-run right now.
+ * Reports the workflow run that woke the gate as unfinished, whatever its check
+ * runs currently say.
  *
- * The whole reason a re-run wakes the gate is that its verdict is stale, and for
- * a few seconds after the event the check run carrying the old failure can still
- * be the one GitHub returns. Publishing that would repeat the red the re-run was
- * meant to clear, which is what teaches people to go and re-run the gate by hand.
+ * The event that wakes the gate arrives before the run it describes is visible.
+ * GitHub returns the newest check run per name, so for a few seconds that is
+ * still the previous attempt's, and on a run's first attempt there may be no
+ * check run at all. Reading that snapshot literally is how an event announcing
+ * that work has STARTED produces a verdict saying the commit is finished.
  *
- * Only failures, and only ones that started before this attempt did. A job that
- * succeeded in the previous attempt is carried into this one and its result still
- * stands, and a failure stamped after this attempt began is this attempt's own.
+ * Three shapes, all of them green when they should not be, all reproduced
+ * against the real assessment:
+ *
+ *   - re-run failed jobs: the old failure is still the newest check run, so the
+ *     gate republishes the red the re-run exists to clear.
+ *   - re-run all jobs: the old successes are still the newest check runs, so the
+ *     gate publishes success while a new attempt runs that may fail.
+ *   - a first attempt whose check runs have not registered: the run is invisible,
+ *     and any older sibling that already passed makes the commit read as done.
+ *
+ * So the run is projected as pending rather than pattern-matched. An entry of
+ * this run is only allowed to keep a terminal result when it can prove it belongs
+ * to this attempt, by having started at or after the attempt did. Anything else,
+ * including a check run with no usable timestamp, reads as unfinished until the
+ * completion event settles it. Pending only ever blocks a merge, so being liberal
+ * with it costs one event of latency and cannot pass a commit that should fail.
  */
-function markRerunning(entries, rerun) {
-  if (!rerun) return entries;
+function markInFlight(entries, inFlight) {
+  if (!inFlight) return entries;
+  const label = inFlight.attempt > 1 ? 're-running' : 'starting';
   return entries.map((entry) => {
-    if (String(entry.workflowRunId) !== rerun.runId) return entry;
-    if (classify(entry) !== 'bad') return entry;
+    if (String(entry.workflowRunId) !== inFlight.runId) return entry;
+    if (classify(entry) === 'pending') return entry;
     const startedMs = Date.parse(entry.startedAt || '');
-    if (Number.isFinite(startedMs) && startedMs >= rerun.startedAtMs) return entry;
-    return { ...entry, status: 'IN_PROGRESS', conclusion: null, stateLabel: 're-running' };
+    if (Number.isFinite(startedMs) && startedMs >= inFlight.startedAtMs) return entry;
+    return { ...entry, status: 'IN_PROGRESS', conclusion: null, stateLabel: label };
   });
+}
+
+/**
+ * The workflow run that woke the gate, as an entry, for when none of its check
+ * runs are visible yet.
+ *
+ * Without this the run contributes nothing and the commit reads as whatever the
+ * other suites happen to say, which on a commit with one older passing job is a
+ * green gate published in response to an event announcing that work has begun.
+ */
+function inFlightEntry(inFlight) {
+  return {
+    projected: true,
+    name: '(jobs not registered yet)',
+    workflowName: inFlight.workflowName || '(unknown workflow)',
+    workflowPath: inFlight.workflowPath || '',
+    workflowRunId: inFlight.runId,
+    status: 'QUEUED',
+    conclusion: null,
+    stateLabel: inFlight.attempt > 1 ? `re-running, attempt ${inFlight.attempt}` : 'starting',
+  };
 }
 
 /**
@@ -156,6 +192,17 @@ function parseRuleList(raw, label) {
     }
     if (!rule.workflowFile && !rule.jobName) {
       throw new Error(`each ${label} entry needs workflowFile, jobName, or both`);
+    }
+    // Typed, not just present. `{"jobName": []}` parses, and `[].startsWith` is
+    // never reached because String([]) is "", so a prefix rule matches every
+    // check run on the commit. In skip-list that ignores everything; in wait-for
+    // the rule is discharged by the first unrelated job and the gate goes green
+    // without the job it was told to wait for.
+    for (const field of ['workflowFile', 'jobName']) {
+      if (rule[field] === undefined || rule[field] === null) continue;
+      if (typeof rule[field] !== 'string' || rule[field].trim() === '') {
+        throw new Error(`${label} ${field} must be a non-empty string, got ${JSON.stringify(rule[field])}`);
+      }
     }
     if (rule.jobMatchMode && !['exact', 'prefix'].includes(rule.jobMatchMode)) {
       throw new Error(`jobMatchMode must be "exact" or "prefix", got "${rule.jobMatchMode}"`);
@@ -845,29 +892,79 @@ function resolveHeadBranch(env = process.env) {
 }
 
 /**
- * The workflow run being re-run right now, or null.
+ * The workflow run whose event woke the gate, or null.
  *
- * `in_progress` is the only signal a re-run gives off. GitHub documents that
+ * The payload is the only authority on that run that does not lag. Everything
+ * else the gate reads is a snapshot of check runs, and the event always arrives
+ * before the snapshot catches up with it, so a verdict computed purely from the
+ * snapshot can contradict the very event that asked for it.
+ *
+ * Every action is parsed, not just the re-run ones. `requested` and `in_progress`
+ * say the run is unfinished, which is a fact the check runs may not show yet.
+ * `completed` carries the run's real conclusion, which is what catches a
+ * previous attempt's success still standing where a failed attempt belongs.
+ *
+ * `in_progress` is the only signal a re-run gives off: GitHub documents that
  * `requested` does not fire for a re-run, and `check_run` and `check_suite`
- * never fire for check suites GitHub Actions created, so there is nothing else
- * to listen to. Verified against the API: clicking "re-run failed jobs" produced
- * `in_progress` with `run_attempt: 2` six seconds later and no `requested`.
- *
- * An attempt of 1 is a workflow starting normally, which needs no special
- * handling: its jobs have no previous verdict to go stale.
+ * never fire for check suites Actions created. Verified against the API, where
+ * "re-run failed jobs" produced `in_progress` with `run_attempt: 2` six seconds
+ * after the click and no `requested` at all.
  */
-function rerunningWorkflowRun(env = process.env) {
+function triggeringWorkflowRun(env = process.env) {
   if (env.GITHUB_EVENT_NAME !== 'workflow_run') return null;
   const payload = readEventPayload(env);
-  if (!payload || payload.action !== 'in_progress') return null;
-  const run = payload.workflow_run;
-  if (!run || !run.id || Number(run.run_attempt || 1) <= 1) return null;
+  const run = payload && payload.workflow_run;
+  if (!run || !run.id) return null;
+  const action = String(payload.action || '');
+  if (!['requested', 'in_progress', 'completed'].includes(action)) return null;
   const startedAtMs = Date.parse(run.run_started_at || '');
   return {
     runId: String(run.id),
-    attempt: Number(run.run_attempt),
+    attempt: Number(run.run_attempt || 1),
     startedAtMs: Number.isFinite(startedAtMs) ? startedAtMs : 0,
+    finished: action === 'completed',
+    conclusion: String(run.conclusion || '').toLowerCase(),
+    workflowName: String(run.name || ''),
+    workflowPath: String(run.path || ''),
   };
+}
+
+/**
+ * The run that woke the gate, as the event describes it rather than as the check
+ * runs currently do.
+ *
+ * Unfinished: its entries are held pending and, if none are visible at all, one
+ * is projected, so an event announcing that work has started can never produce a
+ * verdict saying the commit is finished.
+ *
+ * Finished and not passing: the payload's conclusion is the truth. If no entry of
+ * that run reads bad, the snapshot is still showing an earlier attempt, and a
+ * failure is injected rather than waiting for a later event that may not come.
+ */
+function withTriggeringRun(entries, run, keep = () => true) {
+  if (!run) return entries;
+
+  if (!run.finished) {
+    const marked = markInFlight(entries, run);
+    if (marked.some((entry) => String(entry.workflowRunId) === run.runId)) return marked;
+    const projected = inFlightEntry(run);
+    return keep(projected) ? [...marked, projected] : marked;
+  }
+
+  if (OK_CONCLUSIONS.has(run.conclusion)) return entries;
+  const mine = entries.filter((entry) => String(entry.workflowRunId) === run.runId);
+  if (mine.some((entry) => classify(entry) === 'bad')) return entries;
+  const projected = {
+    projected: true,
+    name: '(run did not pass)',
+    workflowName: run.workflowName || '(unknown workflow)',
+    workflowPath: run.workflowPath || '',
+    workflowRunId: run.runId,
+    status: 'COMPLETED',
+    conclusion: run.conclusion || 'failure',
+    stateLabel: `${run.conclusion || 'failure'}, reported by the event before its check runs caught up`,
+  };
+  return keep(projected) ? [...entries, projected] : entries;
 }
 
 /** Comma or newline separated, so both YAML styles work. */
@@ -1253,7 +1350,7 @@ function buildOptions() {
     waitFor: parseWaitFor(getInput('wait-for')),
     waitForTimeoutSec: parseDurationSeconds(getInput('wait-for-timeout'), 1800),
     timeoutConclusion: parseTimeoutConclusion(getInput('wait-for-timeout-conclusion')),
-    rerun: rerunningWorkflowRun(),
+    triggeringRun: triggeringWorkflowRun(),
     skipOpts: {
       currentRunId: process.env.GITHUB_RUN_ID,
       currentWorkflowFile: currentWorkflowFile(),
@@ -1331,8 +1428,15 @@ function warnConflictingWaitFor(all, skipOpts, waitFor) {
  * Everything the verdict is computed from, in one place, so watch mode's linger
  * loop and wait mode's poll loop reach the same answer from the same state.
  */
-function assessment(all, { skipOpts, rerun, waitFor, waitForTimeoutSec, timeoutConclusion, earlyExit }, nowMs = Date.now()) {
-  const watched = markRerunning(all.filter((entry) => !shouldSkip(entry, skipOpts)), rerun);
+function assessment(all, { skipOpts, triggeringRun, waitFor, waitForTimeoutSec, timeoutConclusion, earlyExit }, nowMs = Date.now()) {
+  // A projected entry goes through skip-list like any other. Waiting on a run the
+  // caller explicitly told the gate to ignore would be a worse bug than the one
+  // the projection fixes.
+  const watched = withTriggeringRun(
+    all.filter((entry) => !shouldSkip(entry, skipOpts)),
+    triggeringRun,
+    (entry) => !shouldSkip(entry, skipOpts)
+  );
   const deadlineMs = waitForDeadlineMs(all, waitForTimeoutSec);
   const { entries: expected, waived } = waitForEntries(watched, waitFor, {
     deadlineMs,
@@ -1368,7 +1472,7 @@ function awaitingArrivalOnly(result) {
 async function runWatch(opts) {
   const {
     ctx, checkName, publish, headBranch, bypassPrefix, skipOpts, dryRun, warmupMs,
-    waitFor, rerun, minimumMs, attemptLimits, waitForTimeoutSec,
+    waitFor, triggeringRun, minimumMs, attemptLimits, waitForTimeoutSec,
   } = opts;
   const reportDropped = droppedReporter();
   const publisher = publish === 'status'
@@ -1379,11 +1483,11 @@ async function runWatch(opts) {
   log(`  event: ${process.env.GITHUB_EVENT_NAME || '(unknown)'}, api retries: ${ctx.retryLimit}`);
   if (skipOpts.skipList.length > 0) log(`  skip-list: ${JSON.stringify(skipOpts.skipList)}`);
   if (waitFor.length > 0) log(`  wait-for: ${JSON.stringify(waitFor)}, timeout ${waitForTimeoutSec}s`);
-  if (rerun) {
+  if (triggeringRun && !triggeringRun.finished) {
     notice(
-      `Woken by a re-run: attempt ${rerun.attempt} of workflow run ${rerun.runId} started at ` +
-        `${new Date(rerun.startedAtMs).toISOString()}. Its previous failures are reported as re-running, ` +
-        'so the gate does not republish the red the re-run exists to clear.'
+      `Woken by workflow run ${triggeringRun.runId} (attempt ${triggeringRun.attempt}) starting. Until its check ` +
+        'runs are visible the gate reports it as unfinished, so an event announcing that work began cannot ' +
+        'publish a verdict saying the commit is done.'
     );
   }
 
@@ -1477,9 +1581,49 @@ async function runWatch(opts) {
       log(`Poll ${polls}: ${Math.round(Math.max(0, state.deadlineMs - Date.now()) / 1000)}s left on wait-for-timeout.`);
     }
     for (const entry of state.entries) log(`  ${formatEntry(entry)}`);
+
+    // Still waiting, and the loop stopped for a reason that is not the deadline:
+    // the poll budget ran out, or no check suite exists to measure a deadline
+    // from. Publishing pending here is the trap this whole branch exists to
+    // avoid. Nothing is coming to recompute a job that never started, so the
+    // context would block on a timeout that is never evaluated. A failure blocks
+    // too, and says which knob was too small.
+    if (awaitingArrivalOnly(state.result)) {
+      const reason = state.deadlineMs == null
+        ? 'no check suite exists on this commit yet, so wait-for-timeout has no clock to run against'
+        : `the gate ran out of polls after ${polls} of ${attemptLimits}, before wait-for-timeout elapsed. ` +
+          'Raise attempt-limits or minimum-interval so their product exceeds wait-for-timeout';
+      warn(`Gave up waiting for ${state.result.pending.length} expected job(s): ${reason}.`);
+      state = {
+        ...state,
+        result: {
+          done: true,
+          ok: false,
+          pending: [],
+          bad: state.result.pending.map((entry) => ({
+            ...entry,
+            status: 'COMPLETED',
+            conclusion: 'failure',
+            stateLabel: `never started, and the gate stopped waiting because ${reason}`,
+          })),
+        },
+      };
+    }
   }
 
   const { result, waived, entries } = state;
+  if (waived.length > 0) {
+    // The one path here that can publish green for a job that never ran. The
+    // clock is the first check suite on the commit, so a commit that already
+    // carried CI arrives with its deadline spent and is waived without the gate
+    // waiting at all. Never silent, whatever the summary says.
+    warn(
+      `Waived ${waived.length} wait-for rule(s) that never matched, because wait-for-timeout-conclusion is ` +
+        `success and the deadline passed. The clock started at ${new Date(state.deadlineMs - waitForTimeoutSec * 1000).toISOString()}, ` +
+        'which is the first check suite on this commit. If that is older than the CI you meant to wait for, ' +
+        'this pass checked nothing.'
+    );
+  }
   const verdict = publisher.verdictFor(result, entries.length, waived);
 
   setOutput('polls', String(polls));
@@ -1610,8 +1754,10 @@ module.exports = {
   currentWorkflowFile,
   shouldSkip,
   unmatchedRules,
-  markRerunning,
-  rerunningWorkflowRun,
+  markInFlight,
+  inFlightEntry,
+  withTriggeringRun,
+  triggeringWorkflowRun,
   placeholderEntry,
   waitForDeadlineMs,
   waitForEntries,
