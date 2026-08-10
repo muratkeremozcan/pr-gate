@@ -170,17 +170,13 @@ inputs:
       allowed to conclude, in the same rule shape as skip-list, e.g.
       [{"workflowFile":"pr-e2e.yml","jobName":"e2e","jobMatchMode":"prefix"}]
 
-      Without this the gate can only reason about check runs that already exist,
-      so a job that arrives late reads as a job that does not exist and the gate
-      publishes a pass before it starts. That is the failure mode for anything
-      chained behind something else: an e2e suite that waits for a deployment, a
-      run triggered in another repository, a job behind an `if:` that has not been
-      evaluated yet.
+      A job that has not started does not exist, so without this the gate can
+      conclude green before anything chained behind a deployment, another
+      repository, or an unevaluated `if:` has registered.
 
-      A rule that matches nothing holds the gate pending rather than letting it
-      conclude. A rule that matches is an ordinary sibling from then on and has to
-      pass like any other. Naming the same job here and in skip-list is a
-      contradiction, and the action warns when it sees one.
+      A rule that matches nothing holds the gate pending. A rule that matches is
+      an ordinary sibling from then on and has to pass like any other. Naming the
+      same job here and in skip-list is a contradiction, and the action warns.
     required: false
     default: '[]'
   wait-for-timeout:
@@ -188,18 +184,11 @@ inputs:
       How long the commit may go quiet with a wait-for rule still unmatched
       before the gate stops waiting. ISO 8601 duration or plain seconds.
 
-      "Quiet" is the operative word: the clock runs from the newest check suite
-      on the commit, so every workflow that starts pushes the deadline out, and
-      it only arrives once nothing new has appeared for the whole duration. A
-      chain of jobs that each start within the timeout of the one before are all
-      waited for.
-
-      Measuring from the first check suite instead would read naturally and be
-      wrong in both directions. A job chained behind a deployment would have to
-      fit inside a budget that started before it could possibly register, so the
-      job this input exists to wait for is the first one cut off. And a commit
-      that already carried CI, from a force-push onto a commit that ran before or
-      the same SHA on two branches, would arrive with the budget already spent.
+      "Quiet" is the operative word. The clock runs from the newest check suite
+      on the commit, so every workflow that starts pushes the deadline out and it
+      arrives only once nothing new has appeared for the whole duration. Anchoring
+      on the first suite instead would cut off the late job this input exists to
+      wait for; waitForDeadlineMs in main.js has the rest of that argument.
     required: false
     default: 'PT30M'
   wait-for-timeout-conclusion:
@@ -207,11 +196,11 @@ inputs:
       What the gate publishes for a wait-for rule that never matched: 'failure'
       (default) or 'success'.
 
-      The default reads the list as "these must run". Use 'success' for the other
-      reading, where a job is conditional and may legitimately never run, so the
-      list means "if it runs, wait for it". The summary names anything let through
-      this way, because a pass that skipped a job it was told to expect should not
-      look like a pass that checked everything.
+      The default reads the list as "these must run". Use 'success' where a job is
+      conditional and may legitimately never run, so the list means "if it runs,
+      wait for it". Anything let through this way is named in the summary and
+      warned about in the log: it is the one path that publishes green for a job
+      that never ran.
     required: false
     default: 'failure'
   early-exit:
