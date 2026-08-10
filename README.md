@@ -27,7 +27,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   workflow_run:
-    types: [completed]
+    types: [in_progress, completed]
     workflows: ['**']
 
 concurrency:
@@ -57,6 +57,75 @@ a job named `gate` would collide with the published verdict.
 
 The `pull_request` trigger publishes the initial verdict. The `workflow_run`
 trigger starts working after this workflow exists on the default branch.
+
+## Re-running a failed job
+
+Nobody has to re-run the gate. A re-run of any workflow on the commit wakes it
+by itself, and the verdict is recomputed from the state of the commit rather
+than remembered from the last one.
+
+`in_progress` is what makes that visible while the re-run is still going.
+`completed` alone leaves the old red published for the whole length of the
+re-run, which reads as a gate that has not noticed, and the usual reaction to
+that is to go and re-run the gate too, or to push an empty commit.
+
+There is no alternative to `in_progress` here. GitHub does not send
+`workflow_run` `requested` for a re-run, and `check_run` and `check_suite` never
+fire for check suites GitHub Actions created. Measured against the API: clicking
+"re-run failed jobs" produced `in_progress` with `run_attempt: 2` six seconds
+later, then `completed` when it finished, and no `requested` at all.
+
+The cost is roughly one more gate run per workflow per commit, a few seconds
+each. In exchange, the moment a re-run starts the gate publishes
+`Waiting on ...: re-running` and the pull request stops showing a failure that is
+already being fixed.
+
+Wait mode cannot do this. There the verdict is the job's own exit code, and that
+job is over, so the only way to move it is to run it again. That is the reason to
+prefer watch mode on a repo where people re-run failed jobs.
+
+## Late and conditional jobs
+
+The gate reasons about check runs that exist. A job that has not started yet does
+not exist, so a gate that concluded before it registered would publish a pass
+that nothing checked. That is the failure mode for anything chained behind
+something else: e2e that waits for a deployment, a suite triggered in another
+repository, a job behind an `if:` that has not been evaluated yet.
+
+`wait-for` names them up front:
+
+```yaml
+with:
+  mode: watch
+  wait-for: |
+    [
+      { "workflowFile": "pr-e2e-vercel-preview.yml", "jobName": "e2e", "jobMatchMode": "prefix" },
+      { "workflowFile": "contract-testing.yml" }
+    ]
+  wait-for-timeout: PT20M
+```
+
+Rules take the same shape as `skip-list`. A rule with no match holds the gate
+pending and says which one it is waiting for. Once it matches, it is an ordinary
+sibling and has to pass like the rest. Naming a job in both `wait-for` and
+`skip-list` is a contradiction, and the action warns rather than waiting for a
+check run it is throwing away on every poll.
+
+`wait-for-timeout` is measured from the first check suite on the commit, not from
+the start of the job reading it, so every event computes the same deadline.
+`wait-for-timeout-conclusion` decides what happens when it runs out: `failure` by
+default, or `success` when the job is genuinely conditional and may never run. A
+pass granted that way names what it let through.
+
+One caller-side change comes with this. When every other job has finished and the
+awaited one has not started, there is nothing left to fire an event, so watch
+mode holds its runner until the job appears or the deadline passes. Give the job
+more `timeout-minutes` than `wait-for-timeout`, or the runner is killed first and
+the gate stays pending:
+
+```yaml
+    timeout-minutes: 25 # must exceed wait-for-timeout
+```
 
 ## Wait mode
 

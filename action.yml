@@ -45,7 +45,12 @@ inputs:
       the job's own exit code. 'watch' computes the verdict once from the current
       state of the commit, publishes it using the primitive selected by publish,
       and exits immediately. Watch mode is meant to be driven by workflow_run
-      completion events.
+      events.
+
+      Watch mode holds its runner in exactly one case: every other job has
+      finished and a wait-for rule has not matched anything yet. A job that has
+      not started fires no events, so leaving at that point would park the gate
+      pending forever and never reach wait-for-timeout.
     required: true
   check-name:
     description: |
@@ -113,6 +118,9 @@ inputs:
       Maximum number of polls before giving up. This bounds how long the gate
       waits for siblings to finish. It is a timeout, not an error retry; see
       api-retry-limit for that.
+
+      Also bounds watch mode's wait-for hold, as a backstop underneath
+      wait-for-timeout.
     required: false
     default: '180'
   api-retry-limit:
@@ -156,6 +164,49 @@ inputs:
       A branch that cannot be resolved never matches.
     required: false
     default: ''
+  wait-for:
+    description: |
+      JSON array of check runs that must appear on the commit before the gate is
+      allowed to conclude, in the same rule shape as skip-list, e.g.
+      [{"workflowFile":"pr-e2e.yml","jobName":"e2e","jobMatchMode":"prefix"}]
+
+      Without this the gate can only reason about check runs that already exist,
+      so a job that arrives late reads as a job that does not exist and the gate
+      publishes a pass before it starts. That is the failure mode for anything
+      chained behind something else: an e2e suite that waits for a deployment, a
+      run triggered in another repository, a job behind an `if:` that has not been
+      evaluated yet.
+
+      A rule that matches nothing holds the gate pending rather than letting it
+      conclude. A rule that matches is an ordinary sibling from then on and has to
+      pass like any other. Naming the same job here and in skip-list is a
+      contradiction, and the action warns when it sees one.
+    required: false
+    default: '[]'
+  wait-for-timeout:
+    description: |
+      How long a wait-for rule may go unmatched before the gate stops waiting.
+      ISO 8601 duration or plain seconds.
+
+      Measured from the first check suite created on the commit, not from the
+      start of this job. Watch mode recomputes the verdict on every event, so a
+      deadline measured from the current run would restart on each one and never
+      arrive. A check suite is created once per workflow and survives re-runs, so
+      every event agrees on when the clock started.
+    required: false
+    default: 'PT30M'
+  wait-for-timeout-conclusion:
+    description: |
+      What the gate publishes for a wait-for rule that never matched: 'failure'
+      (default) or 'success'.
+
+      The default reads the list as "these must run". Use 'success' for the other
+      reading, where a job is conditional and may legitimately never run, so the
+      list means "if it runs, wait for it". The summary names anything let through
+      this way, because a pass that skipped a job it was told to expect should not
+      look like a pass that checked everything.
+    required: false
+    default: 'failure'
   early-exit:
     description: 'Fail as soon as a sibling job fails, instead of waiting for the rest to finish.'
     required: false
