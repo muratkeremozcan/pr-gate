@@ -143,6 +143,44 @@ jobs:
 
           echo "${combined}" | jq -r '.[0].target_url' | grep -q "actions/runs/${GITHUB_RUN_ID}"
 
+      # wait-for is the one input whose whole point is a check run that is NOT
+      # there, so a stub can only prove the arithmetic. Run against this commit's
+      # live check runs with a rule that can never match: first that it holds the
+      # gate open rather than concluding green, then that the deadline turns it
+      # into a failure naming the job. A gate that concluded green here would be
+      # the exact bug, and it would be invisible.
+      - name: Assert wait-for holds a gate that would otherwise pass, then times out
+        env:
+          TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          RULE: '[{"workflowFile":"no-such-workflow.yml"}]'
+        run: |
+          set -o pipefail
+          # Every input is spelled out because this runs main.js directly rather
+          # than through `uses:`, and the runner only applies action.yml defaults
+          # to an action it resolved. Left implicit, skip-same-workflow reads as
+          # false, the gate watches the job it is running in, and the run never
+          # concludes.
+          common() {
+            env INPUT_MODE=wait "INPUT_GITHUB-TOKEN=$TOKEN" INPUT_REF="$SHA" \
+                INPUT_DRY-RUN=true INPUT_ATTEMPT-LIMITS=1 INPUT_WARMUP-DELAY=0 \
+                INPUT_SKIP-SAME-WORKFLOW=true INPUT_EARLY-EXIT=true \
+                INPUT_WAIT-FOR="$RULE" "$@" node main.js
+          }
+
+          # Inside the timeout: pending, so the gate cannot conclude without it.
+          common INPUT_WAIT-FOR-TIMEOUT=P30D | tee within.txt
+          grep -q 'no-such-workflow.yml / (any job): not started yet' within.txt
+          grep -q 'still running' within.txt
+
+          # Past it: a failure that says which job never came.
+          common INPUT_WAIT-FOR-TIMEOUT=PT1S | tee expired.txt
+          grep -q 'no-such-workflow.yml / (any job): never started' expired.txt
+
+          # And the lenient reading of the same input lets the commit through.
+          common INPUT_WAIT-FOR-TIMEOUT=PT1S INPUT_WAIT-FOR-TIMEOUT-CONCLUSION=success | tee waived.txt
+          grep -q 'was let through by wait-for-timeout-conclusion: success' waived.txt
+
       # The bypass is what a hotfix relies on while something is on fire, and it is
       # the one path where publishing a pass is the correct behaviour. Worth proving
       # live: a bypass that quietly fails to publish blocks the merge it exists to

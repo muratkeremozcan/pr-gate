@@ -56,15 +56,27 @@ const notice = (msg) => log(`::notice::${msg}`);
 
 // ─── pure logic, exported for tests ───────────────────────────────────────────
 
-/** Accepts ISO 8601 (`PT1M30S`) or plain seconds (`90`). */
+const SHORT_UNIT_SECONDS = { s: 1, m: 60, h: 3600, d: 86400 };
+
+/**
+ * Accepts `20m`, ISO 8601 (`PT1M30S`) or plain seconds (`90`).
+ *
+ * ISO 8601 and plain seconds are what kachick/wait-other-jobs takes, and matching
+ * it is what makes migrating a caller a one-line change to `uses:`. The short
+ * form is here because `PT20M` in a workflow file is unreadable to anyone who has
+ * not met ISO 8601 durations, and a timeout nobody can read is a timeout nobody
+ * checks. One unit only; anything compound goes through ISO.
+ */
 function parseDurationSeconds(raw, fallbackSeconds) {
   const s = String(raw == null ? '' : raw).trim();
   if (s === '') return fallbackSeconds;
   if (/^\d+(?:\.\d+)?$/.test(s)) return Number(s);
+  const short = /^(\d+(?:\.\d+)?)([smhd])$/i.exec(s);
+  if (short) return Number(short[1]) * SHORT_UNIT_SECONDS[short[2].toLowerCase()];
   const m = /^P(?:(\d+(?:\.\d+)?)D)?(?:T(?:(\d+(?:\.\d+)?)H)?(?:(\d+(?:\.\d+)?)M)?(?:(\d+(?:\.\d+)?)S)?)?$/i
     .exec(s);
   if (!m || (m[1] === undefined && m[2] === undefined && m[3] === undefined && m[4] === undefined)) {
-    throw new Error(`invalid duration "${raw}", use ISO 8601 like PT15S or plain seconds like 15`);
+    throw new Error(`invalid duration "${raw}", use 20m, PT20M or plain seconds like 1200`);
   }
   const total = Number(m[1] || 0) * 86400 + Number(m[2] || 0) * 3600 +
     Number(m[3] || 0) * 60 + Number(m[4] || 0);
@@ -110,28 +122,122 @@ function classify(entry) {
   return OK_CONCLUSIONS.has(String(entry.conclusion || '').toLowerCase()) ? 'ok' : 'bad';
 }
 
-function parseSkipList(raw) {
+/**
+ * Reports the workflow run that woke the gate as unfinished, whatever its check
+ * runs currently say.
+ *
+ * The event that wakes the gate arrives before the run it describes is visible.
+ * GitHub returns the newest check run per name, so for a few seconds that is
+ * still the previous attempt's, and on a run's first attempt there may be no
+ * check run at all. Reading that snapshot literally is how an event announcing
+ * that work has STARTED produces a verdict saying the commit is finished.
+ *
+ * Three shapes, all of them green when they should not be, all reproduced
+ * against the real assessment:
+ *
+ *   - re-run failed jobs: the old failure is still the newest check run, so the
+ *     gate republishes the red the re-run exists to clear.
+ *   - re-run all jobs: the old successes are still the newest check runs, so the
+ *     gate publishes success while a new attempt runs that may fail.
+ *   - a first attempt whose check runs have not registered: the run is invisible,
+ *     and any older sibling that already passed makes the commit read as done.
+ *
+ * So the run is projected as pending rather than pattern-matched. An entry of
+ * this run is only allowed to keep a terminal result when it can prove it belongs
+ * to this attempt, by having started at or after the attempt did. Anything else,
+ * including a check run with no usable timestamp, reads as unfinished until the
+ * completion event settles it. Pending only ever blocks a merge, so being liberal
+ * with it costs one event of latency and cannot pass a commit that should fail.
+ */
+function markInFlight(entries, inFlight) {
+  if (!inFlight) return entries;
+  const label = inFlight.attempt > 1 ? 're-running' : 'starting';
+  return entries.map((entry) => {
+    if (String(entry.workflowRunId) !== inFlight.runId) return entry;
+    if (classify(entry) === 'pending') return entry;
+    const startedMs = Date.parse(entry.startedAt || '');
+    if (Number.isFinite(startedMs) && startedMs >= inFlight.startedAtMs) return entry;
+    return { ...entry, status: 'IN_PROGRESS', conclusion: null, stateLabel: label };
+  });
+}
+
+/**
+ * The workflow run that woke the gate, as an entry, for when none of its check
+ * runs are visible yet.
+ *
+ * Without this the run contributes nothing and the commit reads as whatever the
+ * other suites happen to say, which on a commit with one older passing job is a
+ * green gate published in response to an event announcing that work has begun.
+ */
+function inFlightEntry(inFlight) {
+  return {
+    projected: true,
+    name: '(jobs not registered yet)',
+    workflowName: inFlight.workflowName || '(unknown workflow)',
+    workflowPath: inFlight.workflowPath || '',
+    workflowRunId: inFlight.runId,
+    status: 'QUEUED',
+    conclusion: null,
+    stateLabel: inFlight.attempt > 1 ? `re-running, attempt ${inFlight.attempt}` : 'starting',
+  };
+}
+
+/**
+ * The rule shape shared by `skip-list` and `wait-for`: a workflow file, a job
+ * name, or both. One parser so the two inputs cannot drift into accepting
+ * different spellings of the same rule, and `label` so the error names the input
+ * the caller actually wrote.
+ */
+function parseRuleList(raw, label) {
   const s = String(raw == null ? '' : raw).trim();
   if (s === '') return [];
   let parsed;
   try {
     parsed = JSON.parse(s);
   } catch (e) {
-    throw new Error(`skip-list is not valid JSON: ${e.message}`);
+    throw new Error(`${label} is not valid JSON: ${e.message}`);
   }
-  if (!Array.isArray(parsed)) throw new Error('skip-list must be a JSON array');
+  if (!Array.isArray(parsed)) throw new Error(`${label} must be a JSON array`);
   for (const rule of parsed) {
     if (rule === null || typeof rule !== 'object' || Array.isArray(rule)) {
-      throw new Error('each skip-list entry must be an object');
+      throw new Error(`each ${label} entry must be an object`);
     }
     if (!rule.workflowFile && !rule.jobName) {
-      throw new Error('each skip-list entry needs workflowFile, jobName, or both');
+      throw new Error(`each ${label} entry needs workflowFile, jobName, or both`);
+    }
+    // Typed, not just present. `{"jobName": []}` parses, and `[].startsWith` is
+    // never reached because String([]) is "", so a prefix rule matches every
+    // check run on the commit. In skip-list that ignores everything; in wait-for
+    // the rule is discharged by the first unrelated job and the gate goes green
+    // without the job it was told to wait for.
+    for (const field of ['workflowFile', 'jobName']) {
+      if (rule[field] === undefined || rule[field] === null) continue;
+      if (typeof rule[field] !== 'string' || rule[field].trim() === '') {
+        throw new Error(`${label} ${field} must be a non-empty string, got ${JSON.stringify(rule[field])}`);
+      }
     }
     if (rule.jobMatchMode && !['exact', 'prefix'].includes(rule.jobMatchMode)) {
       throw new Error(`jobMatchMode must be "exact" or "prefix", got "${rule.jobMatchMode}"`);
     }
   }
   return parsed;
+}
+
+const parseSkipList = (raw) => parseRuleList(raw, 'skip-list');
+const parseWaitFor = (raw) => parseRuleList(raw, 'wait-for');
+
+/**
+ * Does one rule describe this check run?
+ *
+ * `skip-list` reads this as "ignore it" and `wait-for` reads it as "this is the
+ * one I was promised". Same predicate either way, so a rule that works in one
+ * input works in the other.
+ */
+function ruleMatches(rule, entry) {
+  if (rule.workflowFile && path.basename(entry.workflowPath || '') !== rule.workflowFile) return false;
+  if (!rule.jobName) return true;
+  const name = String(entry.name || '');
+  return rule.jobMatchMode === 'prefix' ? name.startsWith(rule.jobName) : name === rule.jobName;
 }
 
 /**
@@ -162,34 +268,24 @@ function shouldSkip(entry, { currentRunId, currentWorkflowFile: ownFile, skipSam
     if (ownFile && path.basename(entry.workflowPath || '') === ownFile) return true;
     if (currentRunId && String(entry.workflowRunId) === String(currentRunId)) return true;
   }
-  for (const rule of skipList) {
-    if (rule.workflowFile && path.basename(entry.workflowPath || '') !== rule.workflowFile) continue;
-    if (rule.jobName) {
-      const prefix = rule.jobMatchMode === 'prefix';
-      const name = String(entry.name || '');
-      if (prefix ? !name.startsWith(rule.jobName) : name !== rule.jobName) continue;
-    }
-    return true;
-  }
-  return false;
+  return skipList.some((rule) => ruleMatches(rule, entry));
 }
 
 /**
- * skip-list rules that matched nothing.
+ * Rules that matched nothing on this commit.
  *
- * The failure mode this catches is quiet and expensive: a rule naming
- * `claude-code-review.yml` when the repo's file is `claude-code-review.yaml`
- * matches nothing, so the gate waits on, and can fail because of, a job it was
- * explicitly told to ignore. Both spellings are legitimate in different repos, so
- * the fix is to report a rule that matches nothing rather than to standardise the
- * filename.
+ * For `skip-list` the failure mode this catches is quiet and expensive: a rule
+ * naming `claude-code-review.yml` when the repo's file is
+ * `claude-code-review.yaml` matches nothing, so the gate waits on, and can fail
+ * because of, a job it was explicitly told to ignore. Both spellings are
+ * legitimate in different repos, so the fix is to report a rule that matches
+ * nothing rather than to standardise the filename.
+ *
+ * For `wait-for` an unmatched rule is not a warning at all: it is the job that
+ * has not registered yet, which is the thing that input exists to wait for.
  */
-function unmatchedSkipRules(entries, skipList) {
-  return skipList.filter(
-    (rule) => !entries.some((entry) =>
-      shouldSkip(entry, { skipSameWorkflow: false, skipList: [rule] })
-    )
-  );
+function unmatchedRules(entries, rules) {
+  return rules.filter((rule) => !entries.some((entry) => ruleMatches(rule, entry)));
 }
 
 /**
@@ -212,10 +308,85 @@ function evaluate(entries, { earlyExit }) {
 }
 
 function formatEntry(entry) {
-  const state = classify(entry) === 'pending'
+  // stateLabel is for entries whose real state would misdescribe them: a
+  // placeholder for a job that has not registered would otherwise read `queued`,
+  // which is what a job that GitHub has actually accepted reads.
+  const state = entry.stateLabel || (classify(entry) === 'pending'
     ? String(entry.status || '').toLowerCase()
-    : String(entry.conclusion || '').toLowerCase();
+    : String(entry.conclusion || '').toLowerCase());
   return `${entry.workflowName || '(unknown workflow)'} / ${entry.name}: ${state}`;
+}
+
+// ─── wait-for: jobs that arrive late, conditionally, or not at all ────────────
+
+/**
+ * A `wait-for` rule that has not appeared on the commit, rendered as a check run.
+ *
+ * Modelled as an entry rather than as a second kind of thing the verdict has to
+ * know about, because counting, formatting, listing, truncating and the two
+ * publishing primitives already handle entries. A job that has not registered is
+ * a job whose status the gate does not have yet, which is what `pending` means.
+ */
+function placeholderEntry(rule, state) {
+  return {
+    placeholder: true,
+    name: rule.jobName ? `${rule.jobName}${rule.jobMatchMode === 'prefix' ? '*' : ''}` : '(any job)',
+    workflowName: rule.workflowFile || '(any workflow)',
+    ...state,
+  };
+}
+
+const NOT_STARTED = { status: 'QUEUED', conclusion: null, stateLabel: 'not started yet' };
+const NEVER_STARTED = { status: 'COMPLETED', conclusion: 'failure', stateLabel: 'never started' };
+
+/**
+ * When the wait-for clock runs out, as a millisecond timestamp, or null while
+ * nothing has registered on the commit at all.
+ *
+ * The timeout means "the commit has been quiet this long", not "this long since
+ * CI started". Anchored on the newest check suite, so every workflow that starts
+ * pushes the deadline out and it only arrives once nothing new has appeared for
+ * the full timeout.
+ *
+ * Measuring from the earliest suite instead reads naturally and is wrong in both
+ * directions. A job chained behind a deployment has to fit inside a budget that
+ * started before it could possibly register, so the thing this input exists to
+ * wait for is the first thing cut off. And a commit that already carried CI, from
+ * a force-push onto a commit that ran before or the same SHA on two branches,
+ * arrives with the budget already spent: the deadline is in the past on the very
+ * first look, and a caller who chose to let a missing job through gets that
+ * decision applied without the gate waiting at all.
+ *
+ * Suites are only ever added to a commit, so this moves forward and never back.
+ * Callers must read it from the assessment that used it rather than keeping a
+ * copy, or they will sleep against one deadline while the verdict turns on
+ * another.
+ *
+ * Null while the commit carries no suites yet. A deadline measured from a clock
+ * that has not started would expire immediately and fail a gate for a job that
+ * was never given the chance to register.
+ */
+function waitForDeadlineMs(entries, timeoutSeconds) {
+  const stamps = entries
+    .map((entry) => Date.parse(entry.suiteCreatedAt || ''))
+    .filter((ms) => Number.isFinite(ms));
+  return stamps.length === 0 ? null : Math.max(...stamps) + timeoutSeconds * 1000;
+}
+
+/**
+ * The `wait-for` rules with nothing to show for them yet, as entries the verdict
+ * can carry.
+ *
+ * Before the deadline they are pending, which holds the gate open. After it they
+ * become the configured conclusion: a failure that names them, or nothing at all
+ * when the caller said a job that never runs is acceptable.
+ */
+function waitForEntries(watched, waitFor, { deadlineMs, nowMs, timeoutConclusion }) {
+  const missing = unmatchedRules(watched, waitFor);
+  const expired = missing.length > 0 && deadlineMs != null && nowMs >= deadlineMs;
+  if (!expired) return { entries: missing.map((rule) => placeholderEntry(rule, NOT_STARTED)), waived: [] };
+  if (timeoutConclusion === 'success') return { entries: [], waived: missing };
+  return { entries: missing.map((rule) => placeholderEntry(rule, NEVER_STARTED)), waived: [] };
 }
 
 /**
@@ -234,14 +405,24 @@ function codeSpan(text) {
 // verdict entirely, so the list is bounded well short of the limit.
 const MAX_LISTED_ENTRIES = 30;
 
-function entryList(heading, entries) {
-  const shown = entries.slice(0, MAX_LISTED_ENTRIES);
-  const lines = shown.map((entry) => `- ${codeSpan(formatEntry(entry))}`);
-  if (entries.length > shown.length) {
-    lines.push(`- and ${entries.length - shown.length} more`);
+function bulletList(heading, items, format) {
+  const shown = items.slice(0, MAX_LISTED_ENTRIES);
+  const lines = shown.map((item) => `- ${codeSpan(format(item))}`);
+  if (items.length > shown.length) {
+    lines.push(`- and ${items.length - shown.length} more`);
   }
   return [heading, ...lines].join('\n');
 }
+
+const entryList = (heading, entries) => bulletList(heading, entries, formatEntry);
+
+/** A `wait-for` rule as the caller wrote it, for a verdict that has no entry to name. */
+function formatRule(rule) {
+  const job = rule.jobName ? ` / ${rule.jobName}${rule.jobMatchMode === 'prefix' ? '*' : ''}` : '';
+  return `${rule.workflowFile || '(any workflow)'}${job}`;
+}
+
+const ruleList = (heading, rules) => bulletList(heading, rules, formatRule);
 
 /**
  * The check run body for a verdict, for watch mode.
@@ -251,24 +432,69 @@ function entryList(heading, entries) {
  * blocking the merge. That is the fail-closed direction: a gate that never hears
  * about the last sibling leaves the PR unmergeable rather than mergeable.
  */
-function verdictCheckRun(result, { name, totalWatched }) {
+function verdictCheckRun(result, { name, totalWatched, waived = [] }) {
+  const awaited = (list) => list.filter((entry) => entry.placeholder);
+
   if (!result.done) {
+    const expected = awaited(result.pending);
+    const running = result.pending.filter((entry) => !entry.placeholder);
+    // Said differently when nothing is actually running, because "waiting on 1 of
+    // 12" reads as a slow job rather than as a job that has not started, and the
+    // two need different reactions from whoever is looking at the pull request.
+    if (running.length === 0 && expected.length > 0) {
+      return {
+        name,
+        status: 'in_progress',
+        title: `Waiting for ${expected.length} expected job(s) to start`,
+        summary: entryList(
+          'Every other job on this commit finished. These are listed in `wait-for` and have not registered a check run yet:',
+          expected
+        ),
+      };
+    }
     return {
       name,
       status: 'in_progress',
       title: `Waiting on ${result.pending.length} of ${totalWatched} job(s)`,
-      summary: entryList('Still running:', result.pending),
+      summary: [
+        entryList('Still running:', running),
+        expected.length > 0 ? entryList('Expected, not started yet:', expected) : '',
+      ].filter(Boolean).join('\n\n'),
     };
   }
+
   if (result.ok) {
     return {
       name,
       status: 'completed',
       conclusion: 'success',
       title: `All ${totalWatched} watched job(s) passed`,
-      summary: totalWatched === 0
-        ? 'No other check runs on this commit, so there was nothing to gate.'
-        : 'Every watched check run on this commit finished and passed.',
+      summary: [
+        totalWatched === 0
+          ? 'No other check runs on this commit, so there was nothing to gate.'
+          : 'Every watched check run on this commit finished and passed.',
+        waived.length > 0
+          ? ruleList(
+            'These never started before `wait-for-timeout` ran out, and were let through because ' +
+              '`wait-for-timeout-conclusion` is `success`:',
+            waived
+          )
+          : '',
+      ].filter(Boolean).join('\n\n'),
+    };
+  }
+
+  const expected = awaited(result.bad);
+  if (expected.length === result.bad.length) {
+    return {
+      name,
+      status: 'completed',
+      conclusion: 'failure',
+      title: `${expected.length} expected job(s) never started`,
+      summary: entryList(
+        'Listed in `wait-for`, but no matching check run appeared on this commit before `wait-for-timeout` ran out:',
+        expected
+      ),
     };
   }
   return {
@@ -334,8 +560,8 @@ function statusState(checkRun) {
  * reads as unfinished, so a gate that never hears about the last sibling leaves
  * the pull request unmergeable rather than mergeable.
  */
-function verdictStatus(result, { context, totalWatched }) {
-  const checkRun = verdictCheckRun(result, { name: context, totalWatched });
+function verdictStatus(result, { context, totalWatched, waived = [] }) {
+  const checkRun = verdictCheckRun(result, { name: context, totalWatched, waived });
   return {
     context,
     state: statusState(checkRun),
@@ -432,9 +658,14 @@ function flattenCheckSuites(suites, onDropped = () => {}) {
         conclusion: run.conclusion,
         url: run.detailsUrl,
         externalId: run.externalId || '',
+        startedAt: run.startedAt || '',
         workflowName: suite.workflowRun.workflow?.name || '',
         workflowPath: suite.workflowRun.workflow?.resourcePath || '',
         workflowRunId: suite.workflowRun.databaseId,
+        // When CI first started on this commit, for the wait-for deadline. Read
+        // off the suite rather than the check run because a suite survives
+        // re-runs, so every event computes the same deadline.
+        suiteCreatedAt: suite.createdAt || '',
       });
     }
   }
@@ -454,6 +685,7 @@ const SUITES_QUERY = /* GraphQL */ `
             pageInfo { hasNextPage endCursor }
             nodes {
               id
+              createdAt
               workflowRun {
                 databaseId
                 workflow { name resourcePath }
@@ -461,7 +693,7 @@ const SUITES_QUERY = /* GraphQL */ `
               checkRuns(first: 100) {
                 totalCount
                 pageInfo { hasNextPage endCursor }
-                nodes { name status conclusion detailsUrl externalId }
+                nodes { name status conclusion detailsUrl externalId startedAt }
               }
             }
           }
@@ -477,7 +709,7 @@ const SUITE_RUNS_QUERY = /* GraphQL */ `
       ... on CheckSuite {
         checkRuns(first: 100, after: $cursor) {
           pageInfo { hasNextPage endCursor }
-          nodes { name status conclusion detailsUrl externalId }
+          nodes { name status conclusion detailsUrl externalId startedAt }
         }
       }
     }
@@ -681,6 +913,82 @@ function resolveHeadBranch(env = process.env) {
   const fromPayload = payload?.pull_request?.head?.ref || payload?.workflow_run?.head_branch;
   if (fromPayload) return String(fromPayload);
   return String(env.GITHUB_HEAD_REF || env.GITHUB_REF_NAME || '');
+}
+
+/**
+ * The workflow run whose event woke the gate, or null.
+ *
+ * The payload is the only authority on that run that does not lag. Everything
+ * else the gate reads is a snapshot of check runs, and the event always arrives
+ * before the snapshot catches up with it, so a verdict computed purely from the
+ * snapshot can contradict the very event that asked for it.
+ *
+ * Every action is parsed, not just the re-run ones. `requested` and `in_progress`
+ * say the run is unfinished, which is a fact the check runs may not show yet.
+ * `completed` carries the run's real conclusion, which is what catches a
+ * previous attempt's success still standing where a failed attempt belongs.
+ *
+ * `in_progress` is the only signal a re-run gives off: GitHub documents that
+ * `requested` does not fire for a re-run, and `check_run` and `check_suite`
+ * never fire for check suites Actions created. Verified against the API, where
+ * "re-run failed jobs" produced `in_progress` with `run_attempt: 2` six seconds
+ * after the click and no `requested` at all.
+ */
+function triggeringWorkflowRun(env = process.env) {
+  if (env.GITHUB_EVENT_NAME !== 'workflow_run') return null;
+  const payload = readEventPayload(env);
+  const run = payload && payload.workflow_run;
+  if (!run || !run.id) return null;
+  const action = String(payload.action || '');
+  if (!['requested', 'in_progress', 'completed'].includes(action)) return null;
+  const startedAtMs = Date.parse(run.run_started_at || '');
+  return {
+    runId: String(run.id),
+    attempt: Number(run.run_attempt || 1),
+    startedAtMs: Number.isFinite(startedAtMs) ? startedAtMs : 0,
+    finished: action === 'completed',
+    conclusion: String(run.conclusion || '').toLowerCase(),
+    workflowName: String(run.name || ''),
+    workflowPath: String(run.path || ''),
+  };
+}
+
+/**
+ * The run that woke the gate, as the event describes it rather than as the check
+ * runs currently do.
+ *
+ * Unfinished: its entries are held pending and, if none are visible at all, one
+ * is projected, so an event announcing that work has started can never produce a
+ * verdict saying the commit is finished.
+ *
+ * Finished and not passing: the payload's conclusion is the truth. If no entry of
+ * that run reads bad, the snapshot is still showing an earlier attempt, and a
+ * failure is injected rather than waiting for a later event that may not come.
+ */
+function withTriggeringRun(entries, run, keep = () => true) {
+  if (!run) return entries;
+
+  if (!run.finished) {
+    const marked = markInFlight(entries, run);
+    if (marked.some((entry) => String(entry.workflowRunId) === run.runId)) return marked;
+    const projected = inFlightEntry(run);
+    return keep(projected) ? [...marked, projected] : marked;
+  }
+
+  if (OK_CONCLUSIONS.has(run.conclusion)) return entries;
+  const mine = entries.filter((entry) => String(entry.workflowRunId) === run.runId);
+  if (mine.some((entry) => classify(entry) === 'bad')) return entries;
+  const projected = {
+    projected: true,
+    name: '(run did not pass)',
+    workflowName: run.workflowName || '(unknown workflow)',
+    workflowPath: run.workflowPath || '',
+    workflowRunId: run.runId,
+    status: 'COMPLETED',
+    conclusion: run.conclusion || 'failure',
+    stateLabel: `${run.conclusion || 'failure'}, reported by the event before its check runs caught up`,
+  };
+  return keep(projected) ? [...entries, projected] : entries;
 }
 
 /** Comma or newline separated, so both YAML styles work. */
@@ -925,7 +1233,7 @@ function appendStepSummary(markdown) {
 function checkRunPublisher(ctx, name) {
   return {
     label: 'check run',
-    verdictFor: (result, totalWatched) => verdictCheckRun(result, { name, totalWatched }),
+    verdictFor: (result, totalWatched, waived) => verdictCheckRun(result, { name, totalWatched, waived }),
     bypassFor: (bypass) => bypassCheckRun(name, bypass),
     describe: (verdict) =>
       `${verdict.status}${verdict.conclusion ? `/${verdict.conclusion}` : ''}: ${verdict.title}`,
@@ -939,8 +1247,18 @@ function checkRunPublisher(ctx, name) {
       return existing;
     },
     async write(existing, verdict) {
-      const { created } = await writeCheckRun(ctx, verdict, existing);
-      return created ? 'Created' : 'Updated';
+      const { created, id } = await writeCheckRun(ctx, verdict, existing);
+      // Hands back the check run it just wrote, so a caller that writes twice
+      // updates the second time instead of creating again. The id comes from the
+      // write itself and not from a fresh lookup: the check-runs list is not
+      // read-your-writes consistent, so a create followed immediately by a
+      // lookup can come back empty, and a second create would leave two check
+      // runs holding one required name. Falls back to the lookup only when the
+      // response carried no id at all.
+      return {
+        note: created ? 'Created' : 'Updated',
+        handle: id ? { id } : await findOwnedCheckRun(ctx, name),
+      };
     },
   };
 }
@@ -949,7 +1267,7 @@ function commitStatusPublisher(ctx, context) {
   const targetUrl = workflowRunUrl();
   return {
     label: 'commit status',
-    verdictFor: (result, totalWatched) => verdictStatus(result, { context, totalWatched }),
+    verdictFor: (result, totalWatched, waived) => verdictStatus(result, { context, totalWatched, waived }),
     bypassFor: (bypass) => bypassStatus(context, bypass),
     describe: (verdict) => `${verdict.state}: ${verdict.description}`,
     // Nothing to read: there is no id to keep and no foreign owner to refuse,
@@ -972,9 +1290,26 @@ function commitStatusPublisher(ctx, context) {
       // status. It goes to the job summary, which is what target_url points at.
       appendStepSummary(`## ${verdict.title}\n\n${verdict.summary}\n`);
       await writeCommitStatus(ctx, verdict, targetUrl);
-      return 'Published';
+      // No handle to carry: a status has no id, and posting one supersedes
+      // whatever held the context before, so writing twice cannot duplicate it.
+      return { note: 'Published', handle: null };
     },
   };
+}
+
+/**
+ * What the gate publishes for a `wait-for` job that never appeared. Defaulted to
+ * a failure, because a job the caller named as expected and never got is the
+ * case this input exists to catch. `success` is for the other reading of the same
+ * input: a conditional job that may legitimately not run at all, where the list
+ * says "if it runs, wait for it" rather than "it must run".
+ */
+function parseTimeoutConclusion(raw) {
+  const value = String(raw == null ? '' : raw).trim() || 'failure';
+  if (!['failure', 'success'].includes(value)) {
+    throw new Error(`wait-for-timeout-conclusion must be failure or success, got "${value}"`);
+  }
+  return value;
 }
 
 /**
@@ -1036,6 +1371,10 @@ function buildOptions() {
     attemptLimits: Math.max(1, Math.trunc(parseIntOr(getInput('attempt-limits'), 180))),
     earlyExit: getBooleanInput('early-exit'),
     dryRun: getBooleanInput('dry-run'),
+    waitFor: parseWaitFor(getInput('wait-for')),
+    waitForTimeoutSec: parseDurationSeconds(getInput('wait-for-timeout'), 1800),
+    timeoutConclusion: parseTimeoutConclusion(getInput('wait-for-timeout-conclusion')),
+    triggeringRun: triggeringWorkflowRun(),
     skipOpts: {
       currentRunId: process.env.GITHUB_RUN_ID,
       currentWorkflowFile: currentWorkflowFile(),
@@ -1085,9 +1424,65 @@ function warnLeftoverCheckRun(all, ownExternalId, checkName) {
 function warnUnmatchedSkips(all, skipList) {
   // Report a skip-list rule that matches nothing. Usually a filename typo, and
   // the quiet version leaves the gate waiting on the job it was told to skip.
-  for (const rule of unmatchedSkipRules(all, skipList)) {
+  for (const rule of unmatchedRules(all, skipList)) {
     warn(`skip-list rule ${JSON.stringify(rule)} matched no check run on this commit. Check the workflow filename and job name.`);
   }
+}
+
+/**
+ * Reports a `wait-for` rule that names something `skip-list` throws away.
+ *
+ * The two inputs are opposites, so a rule in both is a configuration mistake with
+ * an expensive shape: the gate holds the pull request open for the whole of
+ * `wait-for-timeout` waiting for a check run it is deleting from its own view on
+ * every poll, and then fails for a job that was there the entire time.
+ */
+function warnConflictingWaitFor(all, skipOpts, waitFor) {
+  const skipped = all.filter((entry) => shouldSkip(entry, skipOpts));
+  for (const rule of waitFor) {
+    if (!skipped.some((entry) => ruleMatches(rule, entry))) continue;
+    warn(
+      `wait-for rule ${JSON.stringify(rule)} matches a check run that skip-list ignores, so the gate ` +
+        'can never see it. Remove it from one of the two inputs.'
+    );
+  }
+}
+
+/**
+ * Everything the verdict is computed from, in one place, so watch mode's linger
+ * loop and wait mode's poll loop reach the same answer from the same state.
+ */
+function assessment(all, { skipOpts, triggeringRun, waitFor, waitForTimeoutSec, timeoutConclusion, earlyExit }, nowMs = Date.now()) {
+  // A projected entry goes through skip-list like any other. Waiting on a run the
+  // caller explicitly told the gate to ignore would be a worse bug than the one
+  // the projection fixes.
+  const watched = withTriggeringRun(
+    all.filter((entry) => !shouldSkip(entry, skipOpts)),
+    triggeringRun,
+    (entry) => !shouldSkip(entry, skipOpts)
+  );
+  const deadlineMs = waitForDeadlineMs(all, waitForTimeoutSec);
+  const { entries: expected, waived } = waitForEntries(watched, waitFor, {
+    deadlineMs,
+    nowMs,
+    timeoutConclusion,
+  });
+  const entries = [...watched, ...expected];
+  // The deadline is returned rather than recomputed by the caller. It decides
+  // `expired` here, so a caller holding its own copy could sleep against one
+  // deadline while the loop exits on another.
+  return { all, watched, entries, waived, deadlineMs, result: evaluate(entries, { earlyExit }) };
+}
+
+/**
+ * True when the only thing holding the gate open is a `wait-for` job that has not
+ * registered. Nothing on the commit will produce another event until it does, so
+ * this is the one state where an event-driven gate has to hold its runner.
+ */
+function awaitingArrivalOnly(result) {
+  return !result.done
+    && result.pending.length > 0
+    && result.pending.every((entry) => entry.placeholder);
 }
 
 /**
@@ -1099,7 +1494,10 @@ function warnUnmatchedSkips(all, skipList) {
  * stays green even when the gate is red.
  */
 async function runWatch(opts) {
-  const { ctx, checkName, publish, headBranch, bypassPrefix, skipOpts, earlyExit, dryRun, warmupMs } = opts;
+  const {
+    ctx, checkName, publish, headBranch, bypassPrefix, skipOpts, dryRun, warmupMs,
+    waitFor, triggeringRun, minimumMs, attemptLimits, waitForTimeoutSec,
+  } = opts;
   const reportDropped = droppedReporter();
   const publisher = publish === 'status'
     ? commitStatusPublisher(ctx, checkName)
@@ -1108,6 +1506,14 @@ async function runWatch(opts) {
   log(`Gate (watch) on ${ctx.owner}/${ctx.repo}@${ctx.sha}, publishing ${publisher.label} "${checkName}"`);
   log(`  event: ${process.env.GITHUB_EVENT_NAME || '(unknown)'}, api retries: ${ctx.retryLimit}`);
   if (skipOpts.skipList.length > 0) log(`  skip-list: ${JSON.stringify(skipOpts.skipList)}`);
+  if (waitFor.length > 0) log(`  wait-for: ${JSON.stringify(waitFor)}, timeout ${waitForTimeoutSec}s`);
+  if (triggeringRun && !triggeringRun.finished) {
+    notice(
+      `Woken by workflow run ${triggeringRun.runId} (attempt ${triggeringRun.attempt}) starting. Until its check ` +
+        'runs are visible the gate reports it as unfinished, so an event announcing that work began cannot ' +
+        'publish a verdict saying the commit is done.'
+    );
+  }
 
   if (bypassPrefix) {
     const verdict = publisher.bypassFor({ branch: headBranch, prefix: bypassPrefix });
@@ -1126,14 +1532,12 @@ async function runWatch(opts) {
     return 0;
   }
 
-  const collect = async () => {
-    const all = flattenCheckSuites(await fetchChecks(ctx), reportDropped);
-    return { all, watched: all.filter((entry) => !shouldSkip(entry, skipOpts)) };
-  };
+  const assess = async () =>
+    assessment(flattenCheckSuites(await fetchChecks(ctx), reportDropped), opts);
 
   // Invalidate before computing anything. Recomputing and only then discovering
   // the write fails is what leaves a stale green behind.
-  const handle = dryRun ? null : await publisher.prepare();
+  let handle = dryRun ? null : await publisher.prepare();
 
   const seedEvent = ['pull_request', 'pull_request_target'].includes(process.env.GITHUB_EVENT_NAME);
   if (seedEvent && warmupMs > 0) {
@@ -1144,25 +1548,106 @@ async function runWatch(opts) {
     await sleep(warmupMs);
   }
 
-  let { all, watched } = await collect();
-  if (watched.length === 0 && !seedEvent && warmupMs > 0) {
+  let state = await assess();
+  if (state.watched.length === 0 && !seedEvent && warmupMs > 0) {
     // Nothing visible on a completion event should be impossible, since the
     // workflow that triggered it is itself a check run on this commit. Warm up
     // and look again rather than concluding success off an empty read.
     warn(`No watched check runs visible on a ${process.env.GITHUB_EVENT_NAME} event. Retrying after ${Math.round(warmupMs / 1000)}s.`);
     await sleep(warmupMs);
-    ({ all, watched } = await collect());
+    state = await assess();
   }
 
-  log(`${watched.length} watched check run(s) of ${all.length} total.`);
-  for (const entry of watched) log(`  ${formatEntry(entry)}`);
-  if (all.length > 0) warnUnmatchedSkips(all, skipOpts.skipList);
-  if (publish === 'status') warnLeftoverCheckRun(all, skipOpts.ownExternalId, checkName);
+  log(`${state.watched.length} watched check run(s) of ${state.all.length} total.`);
+  for (const entry of state.entries) log(`  ${formatEntry(entry)}`);
+  if (state.all.length > 0) warnUnmatchedSkips(state.all, skipOpts.skipList);
+  if (waitFor.length > 0) warnConflictingWaitFor(state.all, skipOpts, waitFor);
+  if (publish === 'status') warnLeftoverCheckRun(state.all, skipOpts.ownExternalId, checkName);
 
-  const result = evaluate(watched, { earlyExit });
-  const verdict = publisher.verdictFor(result, watched.length);
+  let polls = 1;
 
-  setOutput('polls', '1');
+  // The one place watch mode holds a runner. Every other verdict is recomputed by
+  // the next completion event, but a job that has not started produces no events,
+  // so leaving now would park the gate pending until a human noticed and would
+  // never reach wait-for-timeout at all.
+  if (awaitingArrivalOnly(state.result) && !dryRun) {
+    log(`Every other job finished. Waiting for ${state.result.pending.length} expected job(s) to start.`);
+    // Carry forward what that write produced. On the first event of a commit
+    // there was no check run to update, so this write creates one, and publishing
+    // the final verdict against a stale null would create a second check run of
+    // the same required name. Two writers on one name make the status context
+    // flip between them, which is the failure ownership by external_id exists to
+    // prevent.
+    ({ handle } = await publisher.write(handle, publisher.verdictFor(state.result, state.entries.length, state.waived)));
+
+    while (awaitingArrivalOnly(state.result) && polls < attemptLimits) {
+      // A null deadline means no check suite has been created on this commit at
+      // all, so the clock the timeout is measured from has not started. Holding
+      // the runner against a deadline that cannot arrive would burn the job's
+      // timeout and publish nothing.
+      if (state.deadlineMs == null) break;
+      // Read off the last assessment, not captured once before the loop. The
+      // assessment is what decides whether the deadline has passed, so a
+      // separate copy here could sleep against one deadline while the loop exits
+      // on another.
+      //
+      // Never break on an elapsed deadline without looking again first: the state
+      // in hand was read before it passed, so it still says "waiting", and
+      // publishing that would leave the gate pending on a timeout that has
+      // already run out with no event left to come and notice. The floor is what
+      // makes that safe to say. Sleeping the exact remainder would busy-loop
+      // against the API for the rest of attempt-limits if the two ever disagreed,
+      // and a second is nothing against a timeout measured in minutes.
+      const remainingMs = state.deadlineMs - Date.now();
+      await sleep(Math.max(1000, Math.min(minimumMs, remainingMs)));
+      polls += 1;
+      state = await assess();
+      log(`Poll ${polls}: ${Math.round(Math.max(0, state.deadlineMs - Date.now()) / 1000)}s left on wait-for-timeout.`);
+    }
+    for (const entry of state.entries) log(`  ${formatEntry(entry)}`);
+
+    // Still waiting, and the loop stopped for a reason that is not the deadline:
+    // the poll budget ran out, or no check suite exists to measure a deadline
+    // from. Publishing pending here is the trap this whole branch exists to
+    // avoid. Nothing is coming to recompute a job that never started, so the
+    // context would block on a timeout that is never evaluated. A failure blocks
+    // too, and says which knob was too small.
+    if (awaitingArrivalOnly(state.result)) {
+      const reason = state.deadlineMs == null
+        ? 'no check suite exists on this commit yet, so wait-for-timeout has no clock to run against'
+        : `the gate ran out of polls after ${polls} of ${attemptLimits}, before wait-for-timeout elapsed. ` +
+          'Raise attempt-limits or minimum-interval so their product exceeds wait-for-timeout';
+      warn(`Gave up waiting for ${state.result.pending.length} expected job(s): ${reason}.`);
+      state = {
+        ...state,
+        result: {
+          done: true,
+          ok: false,
+          pending: [],
+          bad: state.result.pending.map((entry) => ({
+            ...entry,
+            status: 'COMPLETED',
+            conclusion: 'failure',
+            stateLabel: `never started, and the gate stopped waiting because ${reason}`,
+          })),
+        },
+      };
+    }
+  }
+
+  const { result, waived, entries } = state;
+  if (waived.length > 0) {
+    // The one path here that can publish green for a job that never ran, so it
+    // is never silent whatever the summary says.
+    warn(
+      `Waived ${waived.length} wait-for rule(s) that never matched, because wait-for-timeout-conclusion is ` +
+        `success and nothing new has started on this commit since ` +
+        `${new Date(state.deadlineMs - waitForTimeoutSec * 1000).toISOString()}. This pass did not check them.`
+    );
+  }
+  const verdict = publisher.verdictFor(result, entries.length, waived);
+
+  setOutput('polls', String(polls));
   setOutput('conclusion', result.done ? (result.ok ? 'success' : 'failure') : 'pending');
 
   if (dryRun) {
@@ -1170,19 +1655,20 @@ async function runWatch(opts) {
     return 0;
   }
 
-  const note = await publisher.write(handle, verdict);
+  const { note } = await publisher.write(handle, verdict);
   log(`${note} ${publisher.label} "${checkName}": ${publisher.describe(verdict)}`);
   return 0;
 }
 
 async function runWait(opts) {
-  const { ctx, headBranch, bypassPrefix, skipOpts, earlyExit, dryRun, warmupMs, minimumMs, retryMethod, attemptLimits } = opts;
+  const { ctx, headBranch, bypassPrefix, skipOpts, dryRun, warmupMs, minimumMs, retryMethod, attemptLimits, waitFor, waitForTimeoutSec } = opts;
   const { owner, repo, sha } = ctx;
   const reportDropped = droppedReporter();
 
   log(`Gate (wait) on ${owner}/${repo}@${sha}`);
   log(`  api retries: ${ctx.retryLimit}, poll limit: ${attemptLimits}, interval: ${minimumMs / 1000}s (${retryMethod})`);
   if (skipOpts.skipList.length > 0) log(`  skip-list: ${JSON.stringify(skipOpts.skipList)}`);
+  if (waitFor.length > 0) log(`  wait-for: ${JSON.stringify(waitFor)}, timeout ${waitForTimeoutSec}s`);
 
   // Wait mode publishes nothing, so the bypass is just an early exit. Handled
   // here as well as in watch mode so the input means the same thing in both, and
@@ -1205,22 +1691,23 @@ async function runWait(opts) {
     }
 
     const suites = await fetchChecks(ctx);
-    const all = flattenCheckSuites(suites, reportDropped);
-    const watched = all.filter((entry) => !shouldSkip(entry, skipOpts));
+    const { all, watched, entries, waived, result } = assessment(
+      flattenCheckSuites(suites, reportDropped), opts
+    );
 
     log(`Poll ${attempt}: ${watched.length} watched check run(s) of ${all.length} total.`);
-    for (const entry of watched) log(`  ${formatEntry(entry)}`);
+    for (const entry of entries) log(`  ${formatEntry(entry)}`);
 
     if (!warnedUnmatchedSkips && all.length > 0) {
       warnedUnmatchedSkips = true;
       warnUnmatchedSkips(all, skipOpts.skipList);
+      if (waitFor.length > 0) warnConflictingWaitFor(all, skipOpts, waitFor);
     }
 
     if (watched.length === 0 && attempt === 1) {
       notice('No other check runs visible yet. If this repo genuinely has no other jobs the gate will pass.');
     }
 
-    const result = evaluate(watched, { earlyExit });
     if (!result.done) {
       log(`  ${result.pending.length} still running.`);
       continue;
@@ -1230,6 +1717,9 @@ async function runWait(opts) {
 
     if (result.ok) {
       setOutput('conclusion', 'success');
+      for (const rule of waived) {
+        notice(`wait-for rule ${JSON.stringify(rule)} never appeared before wait-for-timeout, and was let through by wait-for-timeout-conclusion: success.`);
+      }
       log('All watched jobs passed.');
       return 0;
     }
@@ -1279,9 +1769,22 @@ module.exports = {
   parseMode,
   parsePublish,
   parseSkipList,
+  parseWaitFor,
+  parseTimeoutConclusion,
+  ruleMatches,
   currentWorkflowFile,
   shouldSkip,
-  unmatchedSkipRules,
+  unmatchedRules,
+  markInFlight,
+  inFlightEntry,
+  withTriggeringRun,
+  triggeringWorkflowRun,
+  placeholderEntry,
+  waitForDeadlineMs,
+  waitForEntries,
+  assessment,
+  awaitingArrivalOnly,
+  formatRule,
   evaluate,
   isRetryableStatus,
   isRetryableGraphQLErrors,
@@ -1315,4 +1818,8 @@ module.exports = {
   graphql,
   rest,
   upsertCheckRun,
+  // Exported for the linger test. Holding a runner is the one thing watch mode
+  // is not supposed to do, so the conditions that start and end it are worth
+  // asserting against a stubbed API rather than reasoning about.
+  runWatch,
 };

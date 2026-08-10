@@ -20,8 +20,8 @@ description: |
       the runtime's global fetch against the GraphQL API.
 
   Input names and formats match kachick/wait-other-jobs so migrating a caller is
-  a one-line change to `uses:`. Durations accept ISO 8601 (`PT15S`) or plain
-  seconds (`15`).
+  a one-line change to `uses:`. Durations accept a short form (`20m`, `2h`,
+  `30s`), plain seconds (`1200`), or ISO 8601 (`PT20M`).
 
   Two modes. `wait` blocks a job until the siblings finish, which is simple but
   occupies a runner for as long as the slowest job. `watch` recomputes the
@@ -45,7 +45,12 @@ inputs:
       the job's own exit code. 'watch' computes the verdict once from the current
       state of the commit, publishes it using the primitive selected by publish,
       and exits immediately. Watch mode is meant to be driven by workflow_run
-      completion events.
+      events.
+
+      Watch mode holds its runner in exactly one case: every other job has
+      finished and a wait-for rule has not matched anything yet. A job that has
+      not started fires no events, so leaving at that point would park the gate
+      pending forever and never reach wait-for-timeout.
     required: true
   check-name:
     description: |
@@ -97,11 +102,11 @@ inputs:
   warmup-delay:
     description: |
       Wait this long before the first poll, so sibling jobs have had a chance to
-      register their check runs. ISO 8601 duration or plain seconds.
+      register their check runs. `20m`, plain seconds, or ISO 8601.
     required: false
     default: 'PT10S'
   minimum-interval:
-    description: 'Minimum wait between polls. ISO 8601 duration or plain seconds.'
+    description: 'Minimum wait between polls. Accepts `20m`, plain seconds, or ISO 8601.'
     required: false
     default: 'PT15S'
   retry-method:
@@ -113,6 +118,9 @@ inputs:
       Maximum number of polls before giving up. This bounds how long the gate
       waits for siblings to finish. It is a timeout, not an error retry; see
       api-retry-limit for that.
+
+      Also bounds watch mode's wait-for hold, as a backstop underneath
+      wait-for-timeout.
     required: false
     default: '180'
   api-retry-limit:
@@ -123,7 +131,7 @@ inputs:
     required: false
     default: '5'
   api-retry-base-delay:
-    description: 'Base delay for API retry backoff, doubled per attempt with jitter. ISO 8601 duration or plain seconds.'
+    description: 'Base delay for API retry backoff, doubled per attempt with jitter. Accepts `20m`, plain seconds, or ISO 8601.'
     required: false
     default: 'PT2S'
   skip-same-workflow:
@@ -156,6 +164,45 @@ inputs:
       A branch that cannot be resolved never matches.
     required: false
     default: ''
+  wait-for:
+    description: |
+      JSON array of check runs that must appear on the commit before the gate is
+      allowed to conclude, in the same rule shape as skip-list, e.g.
+      [{"workflowFile":"pr-e2e.yml","jobName":"e2e","jobMatchMode":"prefix"}]
+
+      A job that has not started does not exist, so without this the gate can
+      conclude green before anything chained behind a deployment, another
+      repository, or an unevaluated `if:` has registered.
+
+      A rule that matches nothing holds the gate pending. A rule that matches is
+      an ordinary sibling from then on and has to pass like any other. Naming the
+      same job here and in skip-list is a contradiction, and the action warns.
+    required: false
+    default: '[]'
+  wait-for-timeout:
+    description: |
+      How long the commit may go quiet with a wait-for rule still unmatched
+      before the gate stops waiting. Accepts `20m`, plain seconds, or ISO 8601.
+
+      "Quiet" is the operative word. The clock runs from the newest check suite
+      on the commit, so every workflow that starts pushes the deadline out and it
+      arrives only once nothing new has appeared for the whole duration. Anchoring
+      on the first suite instead would cut off the late job this input exists to
+      wait for; waitForDeadlineMs in main.js has the rest of that argument.
+    required: false
+    default: 'PT30M'
+  wait-for-timeout-conclusion:
+    description: |
+      What the gate publishes for a wait-for rule that never matched: 'failure'
+      (default) or 'success'.
+
+      The default reads the list as "these must run". Use 'success' where a job is
+      conditional and may legitimately never run, so the list means "if it runs,
+      wait for it". Anything let through this way is named in the summary and
+      warned about in the log: it is the one path that publishes green for a job
+      that never ran.
+    required: false
+    default: 'failure'
   early-exit:
     description: 'Fail as soon as a sibling job fails, instead of waiting for the rest to finish.'
     required: false
