@@ -1126,8 +1126,18 @@ function checkRunPublisher(ctx, name) {
       return existing;
     },
     async write(existing, verdict) {
-      const { created } = await writeCheckRun(ctx, verdict, existing);
-      return created ? 'Created' : 'Updated';
+      const { created, id } = await writeCheckRun(ctx, verdict, existing);
+      // Hands back the check run it just wrote, so a caller that writes twice
+      // updates the second time instead of creating again. The id comes from the
+      // write itself and not from a fresh lookup: the check-runs list is not
+      // read-your-writes consistent, so a create followed immediately by a
+      // lookup can come back empty, and a second create would leave two check
+      // runs holding one required name. Falls back to the lookup only when the
+      // response carried no id at all.
+      return {
+        note: created ? 'Created' : 'Updated',
+        handle: id ? { id } : await findOwnedCheckRun(ctx, name),
+      };
     },
   };
 }
@@ -1159,7 +1169,9 @@ function commitStatusPublisher(ctx, context) {
       // status. It goes to the job summary, which is what target_url points at.
       appendStepSummary(`## ${verdict.title}\n\n${verdict.summary}\n`);
       await writeCommitStatus(ctx, verdict, targetUrl);
-      return 'Published';
+      // No handle to carry: a status has no id, and posting one supersedes
+      // whatever held the context before, so writing twice cannot duplicate it.
+      return { note: 'Published', handle: null };
     },
   };
 }
@@ -1432,15 +1444,13 @@ async function runWatch(opts) {
   // never reach wait-for-timeout at all.
   if (awaitingArrivalOnly(state.result) && !dryRun) {
     log(`Every other job finished. Waiting for ${state.result.pending.length} expected job(s) to start.`);
-    await publisher.write(handle, publisher.verdictFor(state.result, state.entries.length, state.waived));
-    // Re-read the handle before writing again. On the first event of a commit
-    // there was no check run to update, so that write created one, and publishing
+    // Carry forward what that write produced. On the first event of a commit
+    // there was no check run to update, so this write creates one, and publishing
     // the final verdict against a stale null would create a second check run of
     // the same required name. Two writers on one name make the status context
     // flip between them, which is the failure ownership by external_id exists to
-    // prevent. A commit status has no handle and locate() returns null, because
-    // posting one supersedes whatever held the context before.
-    handle = await publisher.locate();
+    // prevent.
+    ({ handle } = await publisher.write(handle, publisher.verdictFor(state.result, state.entries.length, state.waived)));
 
     while (awaitingArrivalOnly(state.result) && polls < attemptLimits) {
       // A null deadline means no check suite has been created on this commit at
@@ -1480,7 +1490,7 @@ async function runWatch(opts) {
     return 0;
   }
 
-  const note = await publisher.write(handle, verdict);
+  const { note } = await publisher.write(handle, verdict);
   log(`${note} ${publisher.label} "${checkName}": ${publisher.describe(verdict)}`);
   return 0;
 }

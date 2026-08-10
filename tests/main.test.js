@@ -1891,7 +1891,6 @@ describe('lingering does not duplicate the required check run', () => {
     // second create would leave two check runs holding one required name and the
     // context would flip between whichever was written last.
     const created = [];
-    let owned = [];
     let reads = 0;
     // Fixed, not regenerated per read. A timestamp built inside the stub moves
     // the anchor forward on every look, so the deadline recedes and the loop
@@ -1909,10 +1908,12 @@ describe('lingering does not duplicate the required check run', () => {
           ] },
         }] } } } } });
       }
-      if (init.method === 'GET' || !init.method) return res({ check_runs: owned });
+      // Always empty, even after a create. The check-runs list is not
+      // read-your-writes consistent, so looking the check run up again to learn
+      // its id is exactly what cannot be relied on here.
+      if (init.method === 'GET' || !init.method) return res({ check_runs: [] });
       if (target.endsWith('/check-runs')) {
         created.push(JSON.parse(init.body));
-        owned = [{ id: 42, external_id: gate.externalIdFor('gate'), started_at: '2026-08-10T11:00:00Z', status: 'in_progress' }];
         return res({ id: 42 });
       }
       return res({ id: 42 }); // PATCH
@@ -1939,7 +1940,7 @@ describe('lingering does not duplicate the required check run', () => {
       rerun: null,
     });
 
-    assert.strictEqual(created.length, 1, 'created the check run once, then updated it');
+    assert.strictEqual(created.length, 1, 'created the check run once, then updated it by carried id');
     assert.ok(reads >= 2, 'looked again after the wait');
   });
 });
