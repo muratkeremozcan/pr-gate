@@ -185,14 +185,21 @@ inputs:
     default: '[]'
   wait-for-timeout:
     description: |
-      How long a wait-for rule may go unmatched before the gate stops waiting.
-      ISO 8601 duration or plain seconds.
+      How long the commit may go quiet with a wait-for rule still unmatched
+      before the gate stops waiting. ISO 8601 duration or plain seconds.
 
-      Measured from the first check suite created on the commit, not from the
-      start of this job. Watch mode recomputes the verdict on every event, so a
-      deadline measured from the current run would restart on each one and never
-      arrive. A check suite is created once per workflow and survives re-runs, so
-      every event agrees on when the clock started.
+      "Quiet" is the operative word: the clock runs from the newest check suite
+      on the commit, so every workflow that starts pushes the deadline out, and
+      it only arrives once nothing new has appeared for the whole duration. A
+      chain of jobs that each start within the timeout of the one before are all
+      waited for.
+
+      Measuring from the first check suite instead would read naturally and be
+      wrong in both directions. A job chained behind a deployment would have to
+      fit inside a budget that started before it could possibly register, so the
+      job this input exists to wait for is the first one cut off. And a commit
+      that already carried CI, from a force-push onto a commit that ran before or
+      the same SHA on two branches, would arrive with the budget already spent.
     required: false
     default: 'PT30M'
   wait-for-timeout-conclusion:

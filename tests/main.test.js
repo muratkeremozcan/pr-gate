@@ -1618,14 +1618,32 @@ describe('parseTimeoutConclusion', () => {
 describe('waitForDeadlineMs', () => {
   const entry = (createdAt) => ({ suiteCreatedAt: createdAt });
 
-  test('anchors on the first check suite, so every event agrees on the deadline', () => {
-    // Watch mode recomputes on each event. An anchor that moved would restart the
-    // clock on every one of them and the timeout would never arrive.
+  test('anchors on the newest check suite, so the timeout means "quiet this long"', () => {
+    // Measuring from the earliest suite cuts off the late job this input exists
+    // to wait for: it has to fit a budget that started before it could register.
     const deadline = gate.waitForDeadlineMs(
       [entry('2026-08-10T11:10:00Z'), entry('2026-08-10T11:00:00Z'), entry('2026-08-10T11:30:00Z')],
       600
     );
-    assert.strictEqual(deadline, Date.parse('2026-08-10T11:10:00Z'));
+    assert.strictEqual(deadline, Date.parse('2026-08-10T11:40:00Z'));
+  });
+
+  test('a workflow starting pushes the deadline out rather than eating the budget', () => {
+    const first = gate.waitForDeadlineMs([entry('2026-08-10T11:00:00Z')], 600);
+    const later = gate.waitForDeadlineMs(
+      [entry('2026-08-10T11:00:00Z'), entry('2026-08-10T11:09:00Z')], 600
+    );
+    assert.ok(later > first, 'the chain of late jobs each get their own window');
+  });
+
+  test('a commit that already carried CI does not arrive with the budget spent', () => {
+    // The fail-open this replaces: an old suite put the deadline in the past on
+    // the first look, so wait-for-timeout-conclusion: success waived a fresh
+    // missing job without the gate waiting at all.
+    const stale = '2026-08-10T06:00:00Z';
+    const fresh = '2026-08-10T11:59:00Z';
+    const deadline = gate.waitForDeadlineMs([entry(stale), entry(fresh)], 600);
+    assert.ok(deadline > Date.parse(fresh), 'the fresh generation still gets its full window');
   });
 
   test('no suites yet means no deadline, since the clock has not started', () => {

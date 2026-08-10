@@ -331,12 +331,24 @@ const NEVER_STARTED = { status: 'COMPLETED', conclusion: 'failure', stateLabel: 
  * When the wait-for clock runs out, as a millisecond timestamp, or null while
  * nothing has registered on the commit at all.
  *
- * Anchored on the earliest check suite rather than on the clock of whichever
- * event happens to be running. Watch mode computes this fresh on every event, so
- * an anchor that moved would give each event a different deadline and the
- * timeout would mean nothing. A check suite is created once per workflow and
- * survives re-runs, so the anchor is the moment CI first started on this commit
- * and every event agrees on it.
+ * The timeout means "the commit has been quiet this long", not "this long since
+ * CI started". Anchored on the newest check suite, so every workflow that starts
+ * pushes the deadline out and it only arrives once nothing new has appeared for
+ * the full timeout.
+ *
+ * Measuring from the earliest suite instead reads naturally and is wrong in both
+ * directions. A job chained behind a deployment has to fit inside a budget that
+ * started before it could possibly register, so the thing this input exists to
+ * wait for is the first thing cut off. And a commit that already carried CI, from
+ * a force-push onto a commit that ran before or the same SHA on two branches,
+ * arrives with the budget already spent: the deadline is in the past on the very
+ * first look, and a caller who chose to let a missing job through gets that
+ * decision applied without the gate waiting at all.
+ *
+ * Suites are only ever added to a commit, so this moves forward and never back.
+ * Callers must read it from the assessment that used it rather than keeping a
+ * copy, or they will sleep against one deadline while the verdict turns on
+ * another.
  *
  * Null while the commit carries no suites yet. A deadline measured from a clock
  * that has not started would expire immediately and fail a gate for a job that
@@ -346,7 +358,7 @@ function waitForDeadlineMs(entries, timeoutSeconds) {
   const stamps = entries
     .map((entry) => Date.parse(entry.suiteCreatedAt || ''))
     .filter((ms) => Number.isFinite(ms));
-  return stamps.length === 0 ? null : Math.min(...stamps) + timeoutSeconds * 1000;
+  return stamps.length === 0 ? null : Math.max(...stamps) + timeoutSeconds * 1000;
 }
 
 /**
@@ -1613,15 +1625,12 @@ async function runWatch(opts) {
 
   const { result, waived, entries } = state;
   if (waived.length > 0) {
-    // The one path here that can publish green for a job that never ran. The
-    // clock is the first check suite on the commit, so a commit that already
-    // carried CI arrives with its deadline spent and is waived without the gate
-    // waiting at all. Never silent, whatever the summary says.
+    // The one path here that can publish green for a job that never ran, so it
+    // is never silent whatever the summary says.
     warn(
       `Waived ${waived.length} wait-for rule(s) that never matched, because wait-for-timeout-conclusion is ` +
-        `success and the deadline passed. The clock started at ${new Date(state.deadlineMs - waitForTimeoutSec * 1000).toISOString()}, ` +
-        'which is the first check suite on this commit. If that is older than the CI you meant to wait for, ' +
-        'this pass checked nothing.'
+        `success and nothing new has started on this commit since ` +
+        `${new Date(state.deadlineMs - waitForTimeoutSec * 1000).toISOString()}. This pass did not check them.`
     );
   }
   const verdict = publisher.verdictFor(result, entries.length, waived);

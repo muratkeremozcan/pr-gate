@@ -111,11 +111,31 @@ sibling and has to pass like the rest. Naming a job in both `wait-for` and
 `skip-list` is a contradiction, and the action warns rather than waiting for a
 check run it is throwing away on every poll.
 
-`wait-for-timeout` is measured from the first check suite on the commit, not from
-the start of the job reading it, so every event computes the same deadline.
-`wait-for-timeout-conclusion` decides what happens when it runs out: `failure` by
-default, or `success` when the job is genuinely conditional and may never run. A
-pass granted that way names what it let through.
+`wait-for-timeout` measures how long the commit has been **quiet**, not how long
+since CI started. The clock runs from the newest check suite on the commit, so
+every workflow that starts pushes the deadline out, and it only arrives once
+nothing new has appeared for the whole duration:
+
+```
+wait-for: [contract-tests, e2e]      wait-for-timeout: PT20M
+
+10:00  first workflow starts    deadline 10:20
+10:02  contract-tests starts    deadline 10:22
+10:15  deploy starts            deadline 10:35
+10:33  e2e starts               deadline 10:53   e2e is waited for
+```
+
+Measuring from the first suite instead would cut off the job this input exists to
+wait for, because a suite chained behind a deployment has to fit inside a budget
+that started before it could register. It would also hand a commit that already
+carried CI a deadline that is already in the past, and a caller who chose to let
+a missing job through would get that decision applied without any waiting at all.
+
+`wait-for-timeout-conclusion` decides what happens when the clock does run out:
+`failure` by default, or `success` when the job is genuinely conditional and may
+never run. A pass granted that way names what it let through, in the summary and
+as a warning in the log, because it is the one path here that publishes green for
+a job that never ran.
 
 One caller-side change comes with this. When every other job has finished and the
 awaited one has not started, there is nothing left to fire an event, so watch
