@@ -1449,6 +1449,43 @@ function warnConflictingWaitFor(all, skipOpts, waitFor) {
 }
 
 /**
+ * Keeps only the newest check suite per workflow file on this commit.
+ *
+ * A workflow can run more than once against the same SHA: `cancel-in-progress`
+ * concurrency groups, a second `pull_request` event landing before the first
+ * attempt finishes, or a duplicate webhook delivery all leave an earlier
+ * attempt's check runs behind as a separate, completed check suite. `classify()`
+ * cannot tell "superseded" from "actually failed" from the conclusion alone, so
+ * an older attempt's CANCELLED check run would otherwise sit in `bad` forever,
+ * even once the newer attempt it lost to has passed. Read literally, a commit
+ * whose only failing job is a superseded cancellation can never go green.
+ *
+ * Keyed on workflowPath, since two suites for the same workflow file are the
+ * same workflow at different attempts. The newest is the one with the latest
+ * `suiteCreatedAt`; a tie breaks on the higher workflowRunId, which GitHub
+ * hands out in increasing order. Every entry from a suite that loses that
+ * comparison is dropped before evaluate() ever sees it.
+ */
+function latestSuitePerWorkflow(entries) {
+  const newestByWorkflow = new Map();
+  for (const entry of entries) {
+    const key = entry.workflowPath || entry.workflowName || '';
+    const createdMs = Date.parse(entry.suiteCreatedAt || '');
+    const rank = Number.isFinite(createdMs) ? createdMs : -Infinity;
+    const runId = Number(entry.workflowRunId) || 0;
+    const current = newestByWorkflow.get(key);
+    if (!current || rank > current.rank || (rank === current.rank && runId > current.runId)) {
+      newestByWorkflow.set(key, { rank, runId });
+    }
+  }
+  return entries.filter((entry) => {
+    const key = entry.workflowPath || entry.workflowName || '';
+    const runId = Number(entry.workflowRunId) || 0;
+    return runId === newestByWorkflow.get(key).runId;
+  });
+}
+
+/**
  * Everything the verdict is computed from, in one place, so watch mode's linger
  * loop and wait mode's poll loop reach the same answer from the same state.
  */
@@ -1457,7 +1494,7 @@ function assessment(all, { skipOpts, triggeringRun, waitFor, waitForTimeoutSec, 
   // caller explicitly told the gate to ignore would be a worse bug than the one
   // the projection fixes.
   const watched = withTriggeringRun(
-    all.filter((entry) => !shouldSkip(entry, skipOpts)),
+    latestSuitePerWorkflow(all).filter((entry) => !shouldSkip(entry, skipOpts)),
     triggeringRun,
     (entry) => !shouldSkip(entry, skipOpts)
   );
@@ -1782,6 +1819,7 @@ module.exports = {
   placeholderEntry,
   waitForDeadlineMs,
   waitForEntries,
+  latestSuitePerWorkflow,
   assessment,
   awaitingArrivalOnly,
   formatRule,

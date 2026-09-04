@@ -1708,6 +1708,94 @@ describe('waitForEntries', () => {
   });
 });
 
+describe('latestSuitePerWorkflow', () => {
+  const attempt = (runId, createdAt, conclusion) => ({
+    name: 'provider-verify', workflowName: 'Contract test provider',
+    workflowPath: '/o/r/actions/workflows/contract-test-provider.yml',
+    workflowRunId: runId, status: 'COMPLETED', conclusion, suiteCreatedAt: createdAt,
+  });
+
+  test('a superseded cancellation next to the attempt that passed only keeps the passing one', () => {
+    const cancelled = attempt(1, '2026-08-10T11:00:00Z', 'CANCELLED');
+    const passed = attempt(2, '2026-08-10T11:05:00Z', 'SUCCESS');
+    assert.deepStrictEqual(gate.latestSuitePerWorkflow([cancelled, passed]), [passed]);
+  });
+
+  test('suiteCreatedAt decides regardless of array order', () => {
+    const cancelled = attempt(1, '2026-08-10T11:00:00Z', 'CANCELLED');
+    const passed = attempt(2, '2026-08-10T11:05:00Z', 'SUCCESS');
+    assert.deepStrictEqual(gate.latestSuitePerWorkflow([passed, cancelled]), [passed]);
+  });
+
+  test('a tie on suiteCreatedAt breaks on the higher workflowRunId', () => {
+    // GitHub hands out workflowRunId in increasing order, so the higher id is the
+    // newer attempt even when the two suites report the same timestamp.
+    const older = attempt(5, '2026-08-10T11:00:00Z', 'CANCELLED');
+    const newer = attempt(6, '2026-08-10T11:00:00Z', 'SUCCESS');
+    assert.deepStrictEqual(gate.latestSuitePerWorkflow([older, newer]), [newer]);
+  });
+
+  test('a missing or unparsable suiteCreatedAt loses to any dated attempt', () => {
+    const undated = attempt(1, '', 'CANCELLED');
+    const bogusDate = attempt(2, 'not-a-date', 'CANCELLED');
+    const dated = attempt(3, '2026-08-10T11:00:00Z', 'SUCCESS');
+    assert.deepStrictEqual(gate.latestSuitePerWorkflow([undated, bogusDate, dated]), [dated]);
+  });
+
+  test('different workflows on the same commit do not compete', () => {
+    const ci = attempt(1, '2026-08-10T11:00:00Z', 'SUCCESS');
+    const e2e = {
+      ...attempt(2, '2026-08-10T10:00:00Z', 'SUCCESS'),
+      workflowPath: '/o/r/actions/workflows/e2e.yml',
+    };
+    assert.deepStrictEqual(gate.latestSuitePerWorkflow([ci, e2e]), [ci, e2e]);
+  });
+
+  test('a lone attempt is unaffected', () => {
+    const only = attempt(1, '2026-08-10T11:00:00Z', 'SUCCESS');
+    assert.deepStrictEqual(gate.latestSuitePerWorkflow([only]), [only]);
+  });
+});
+
+describe('assessment: a superseded attempt cannot hold the gate red', () => {
+  const opts = {
+    skipOpts: { skipSameWorkflow: false, skipList: [] },
+    triggeringRun: null,
+    waitFor: [],
+    waitForTimeoutSec: 600,
+    timeoutConclusion: 'failure',
+    earlyExit: true,
+  };
+  const attempt = (runId, createdAt, conclusion) => ({
+    name: 'provider-verify', workflowName: 'Contract test provider',
+    workflowPath: '/o/r/actions/workflows/contract-test-provider.yml',
+    workflowRunId: runId, status: 'COMPLETED', conclusion, suiteCreatedAt: createdAt,
+  });
+
+  test('FP-12346: two cancelled attempts and a passing third on the same workflow gate green', () => {
+    // contract-test-provider.yml ran 3 times on one commit, its own concurrency
+    // group cancelled the first two, and the third was green. The gate must not
+    // fail on the two CANCELLED leftovers.
+    const entries = [
+      attempt(101, '2026-08-10T11:00:00Z', 'CANCELLED'),
+      attempt(102, '2026-08-10T11:02:00Z', 'CANCELLED'),
+      attempt(103, '2026-08-10T11:04:00Z', 'SUCCESS'),
+    ];
+    const { result } = gate.assessment(entries, opts);
+    assert.deepStrictEqual([result.done, result.ok], [true, true]);
+  });
+
+  test('a real failure on the newest attempt still fails the gate', () => {
+    const entries = [
+      attempt(101, '2026-08-10T11:00:00Z', 'CANCELLED'),
+      attempt(102, '2026-08-10T11:04:00Z', 'FAILURE'),
+    ];
+    const { result } = gate.assessment(entries, opts);
+    assert.deepStrictEqual([result.done, result.ok], [true, false]);
+    assert.strictEqual(result.bad[0].workflowRunId, 102);
+  });
+});
+
 describe('assessment: wait-for holds a gate that would otherwise pass', () => {
   const suite = { suiteCreatedAt: '2026-08-10T11:00:00Z' };
   const passed = {
