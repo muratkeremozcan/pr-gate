@@ -176,6 +176,9 @@ function inFlightEntry(inFlight) {
     workflowName: inFlight.workflowName || '(unknown workflow)',
     workflowPath: inFlight.workflowPath || '',
     workflowRunId: inFlight.runId,
+    // So latestSuitePerWorkflow can rank this against a stale suite left over
+    // from an earlier, superseded attempt of the same workflow.
+    suiteCreatedAt: new Date(inFlight.startedAtMs).toISOString(),
     status: 'QUEUED',
     conclusion: null,
     stateLabel: inFlight.attempt > 1 ? `re-running, attempt ${inFlight.attempt}` : 'starting',
@@ -984,6 +987,7 @@ function withTriggeringRun(entries, run, keep = () => true) {
     workflowName: run.workflowName || '(unknown workflow)',
     workflowPath: run.workflowPath || '',
     workflowRunId: run.runId,
+    suiteCreatedAt: new Date(run.startedAtMs).toISOString(),
     status: 'COMPLETED',
     conclusion: run.conclusion || 'failure',
     stateLabel: `${run.conclusion || 'failure'}, reported by the event before its check runs caught up`,
@@ -1451,38 +1455,37 @@ function warnConflictingWaitFor(all, skipOpts, waitFor) {
 /**
  * Keeps only the newest check suite per workflow file on this commit.
  *
- * A workflow can run more than once against the same SHA: `cancel-in-progress`
- * concurrency groups, a second `pull_request` event landing before the first
- * attempt finishes, or a duplicate webhook delivery all leave an earlier
- * attempt's check runs behind as a separate, completed check suite. `classify()`
- * cannot tell "superseded" from "actually failed" from the conclusion alone, so
- * an older attempt's CANCELLED check run would otherwise sit in `bad` forever,
- * even once the newer attempt it lost to has passed. Read literally, a commit
- * whose only failing job is a superseded cancellation can never go green.
+ * A workflow can run more than once against the same SHA: a cancel-in-progress
+ * concurrency group, a second pull_request event on the same commit, or a
+ * redelivered webhook all leave an earlier attempt's check runs behind as a
+ * separate, completed check suite. classify() cannot tell a superseded run from
+ * an actually failed one, so an older CANCELLED run would sit in `bad` forever,
+ * even after the attempt that replaced it passed.
  *
- * Keyed on workflowPath, since two suites for the same workflow file are the
- * same workflow at different attempts. The newest is the one with the latest
- * `suiteCreatedAt`; a tie breaks on the higher workflowRunId, which GitHub
- * hands out in increasing order. Every entry from a suite that loses that
- * comparison is dropped before evaluate() ever sees it.
+ * Keyed on the workflow file's basename: a real check suite's workflowPath
+ * (GitHub's resourcePath) and a projected entry's workflowPath (the
+ * workflow_run payload's file path) name the same workflow in different
+ * formats, and the basename is the only part common to both. Ranked by
+ * suiteCreatedAt; a tie breaks on the higher workflowRunId, which GitHub hands
+ * out in increasing order.
+ *
+ * Called on withTriggeringRun's result: a newer attempt with no check runs
+ * registered yet exists only as its projection, and dedup needs to see that
+ * projection to drop the suite it supersedes.
  */
 function latestSuitePerWorkflow(entries) {
+  const key = (entry) => path.basename(entry.workflowPath || '') || entry.workflowName || '';
   const newestByWorkflow = new Map();
   for (const entry of entries) {
-    const key = entry.workflowPath || entry.workflowName || '';
     const createdMs = Date.parse(entry.suiteCreatedAt || '');
     const rank = Number.isFinite(createdMs) ? createdMs : -Infinity;
     const runId = Number(entry.workflowRunId) || 0;
-    const current = newestByWorkflow.get(key);
+    const current = newestByWorkflow.get(key(entry));
     if (!current || rank > current.rank || (rank === current.rank && runId > current.runId)) {
-      newestByWorkflow.set(key, { rank, runId });
+      newestByWorkflow.set(key(entry), { rank, runId });
     }
   }
-  return entries.filter((entry) => {
-    const key = entry.workflowPath || entry.workflowName || '';
-    const runId = Number(entry.workflowRunId) || 0;
-    return runId === newestByWorkflow.get(key).runId;
-  });
+  return entries.filter((entry) => (Number(entry.workflowRunId) || 0) === newestByWorkflow.get(key(entry)).runId);
 }
 
 /**
@@ -1493,11 +1496,11 @@ function assessment(all, { skipOpts, triggeringRun, waitFor, waitForTimeoutSec, 
   // A projected entry goes through skip-list like any other. Waiting on a run the
   // caller explicitly told the gate to ignore would be a worse bug than the one
   // the projection fixes.
-  const watched = withTriggeringRun(
-    latestSuitePerWorkflow(all).filter((entry) => !shouldSkip(entry, skipOpts)),
+  const watched = latestSuitePerWorkflow(withTriggeringRun(
+    all.filter((entry) => !shouldSkip(entry, skipOpts)),
     triggeringRun,
     (entry) => !shouldSkip(entry, skipOpts)
-  );
+  ));
   const deadlineMs = waitForDeadlineMs(all, waitForTimeoutSec);
   const { entries: expected, waived } = waitForEntries(watched, waitFor, {
     deadlineMs,

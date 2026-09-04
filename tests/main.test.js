@@ -1755,6 +1755,18 @@ describe('latestSuitePerWorkflow', () => {
     const only = attempt(1, '2026-08-10T11:00:00Z', 'SUCCESS');
     assert.deepStrictEqual(gate.latestSuitePerWorkflow([only]), [only]);
   });
+
+  test('keys on the basename, so a real suite and a projected entry for the same workflow still compete', () => {
+    // A real check suite's workflowPath is GitHub's resourcePath; a projected
+    // entry's is the workflow_run payload's file path. Different strings, same
+    // workflow, so the key has to reduce both to the file name.
+    const cancelled = attempt(1, '2026-08-10T11:00:00Z', 'CANCELLED');
+    const projected = {
+      ...attempt(2, '2026-08-10T11:05:00Z', 'SUCCESS'),
+      workflowPath: '.github/workflows/contract-test-provider.yml',
+    };
+    assert.deepStrictEqual(gate.latestSuitePerWorkflow([cancelled, projected]), [projected]);
+  });
 });
 
 describe('assessment: a superseded attempt cannot hold the gate red', () => {
@@ -1793,6 +1805,44 @@ describe('assessment: a superseded attempt cannot hold the gate red', () => {
     const { result } = gate.assessment(entries, opts);
     assert.deepStrictEqual([result.done, result.ok], [true, false]);
     assert.strictEqual(result.bad[0].workflowRunId, 102);
+  });
+
+  test('a triggering run that turns out to be the superseded one reads off the attempt that replaced it', () => {
+    // The event that woke the gate is the older run's own cancellation,
+    // arriving after a newer attempt of the same workflow already passed.
+    // Deduping after withTriggeringRun puts that newer entry in the same
+    // ranking pool as the stale one, so it wins on both timestamp and dedup.
+    const entries = [
+      attempt(1, '2026-09-04T13:02:28Z', 'CANCELLED'),
+      attempt(2, '2026-09-04T13:04:04Z', 'SUCCESS'),
+    ];
+    const triggeringRun = {
+      runId: '1', attempt: 1, startedAtMs: Date.parse('2026-09-04T13:02:28Z'),
+      finished: true, conclusion: 'cancelled',
+      workflowName: 'Provider contract verification',
+      workflowPath: '.github/workflows/contract-test-provider.yml',
+    };
+    const { result } = gate.assessment(entries, { ...opts, triggeringRun });
+    assert.deepStrictEqual([result.done, result.ok], [true, true]);
+  });
+
+  test('an in-flight newer attempt with no registered check runs yet supersedes a stale cancellation', () => {
+    // Caught by a CodeRabbit review on this repo's PR #4: latestSuitePerWorkflow
+    // ran before withTriggeringRun added the newer attempt's projection, so a
+    // workflow_run event announcing a fresh attempt, arriving before its own check
+    // runs registered, left the old CANCELLED suite as the only real entry for
+    // that workflow, and earlyExit failed the gate on it immediately.
+    const staleCancelled = attempt(1, '2026-09-04T13:02:00Z', 'CANCELLED');
+    const triggeringRun = {
+      runId: '2', attempt: 1, startedAtMs: Date.parse('2026-09-04T13:05:00Z'),
+      finished: false, conclusion: '', workflowName: 'Contract test provider',
+      // Real suites carry GitHub's resourcePath; a projected entry carries the
+      // workflow_run payload's file path. Different formats, same workflow.
+      workflowPath: '.github/workflows/contract-test-provider.yml',
+    };
+    const { result } = gate.assessment([staleCancelled], { ...opts, triggeringRun });
+    assert.strictEqual(result.done, false);
+    assert.strictEqual(result.ok, true);
   });
 });
 
