@@ -1844,6 +1844,20 @@ describe('assessment: a superseded attempt cannot hold the gate red', () => {
     assert.strictEqual(result.done, false);
     assert.strictEqual(result.ok, true);
   });
+
+  test('a failed triggering run is not suppressed by an older passing attempt', () => {
+    // CodeRabbit review on PR #5: withTriggeringRun runs before latestSuitePerWorkflow,
+    // so entries contains historical attempts. An older passing suite must not
+    // suppress the failure projection of a newer failed triggering run.
+    const olderPassed = attempt(1, '2026-09-04T13:02:00Z', 'SUCCESS');
+    const triggeringRun = {
+      runId: '2', attempt: 1, startedAtMs: Date.parse('2026-09-04T13:05:00Z'),
+      finished: true, conclusion: 'failure', workflowName: 'Contract test provider',
+      workflowPath: '.github/workflows/contract-test-provider.yml',
+    };
+    const { result } = gate.assessment([olderPassed], { ...opts, triggeringRun });
+    assert.deepStrictEqual([result.done, result.ok], [true, false]);
+  });
 });
 
 describe('assessment: wait-for holds a gate that would otherwise pass', () => {

@@ -957,6 +957,32 @@ function triggeringWorkflowRun(env = process.env) {
 }
 
 /**
+ * The dedup key `latestSuitePerWorkflow` and `withTriggeringRun` both need: the
+ * workflow file's basename, falling back to its display name when the path is
+ * empty. GraphQL's `resourcePath` and the webhook's `run.path` format the same
+ * file differently; basename is the one thing both agree on.
+ */
+function workflowKey(entryOrRun) {
+  return path.basename(entryOrRun.workflowPath || '') || entryOrRun.workflowName || '';
+}
+
+/**
+ * Returns true if entry represents a newer run than run.
+ * Ranked by timestamp (suiteCreatedAt vs startedAtMs), breaking ties on higher workflowRunId.
+ */
+function isNewerRun(entry, run) {
+  const entryMs = Date.parse(entry.suiteCreatedAt || '');
+  const entryRank = Number.isFinite(entryMs) ? entryMs : -Infinity;
+  const entryRunId = Number(entry.workflowRunId) || 0;
+
+  const runMs = Number(run.startedAtMs);
+  const runRank = Number.isFinite(runMs) ? runMs : -Infinity;
+  const runId = Number(run.runId) || 0;
+
+  return entryRank > runRank || (entryRank === runRank && entryRunId > runId);
+}
+
+/**
  * The run that woke the gate, as the event describes it rather than as the check
  * runs currently do.
  *
@@ -964,8 +990,12 @@ function triggeringWorkflowRun(env = process.env) {
  * is projected, so an event announcing that work has started can never produce a
  * verdict saying the commit is finished.
  *
- * Finished and not passing: the payload's conclusion is the truth. If no entry of
- * that run reads bad, the snapshot is still showing an earlier attempt, and a
+ * Finished and not passing: the payload's conclusion is the truth, unless
+ * `entries` contains a newer run for the same workflow. That newer run
+ * supersedes `run`, typically when a `cancel-in-progress` concurrency group was
+ * re-triggered before it finished, and its stale conclusion must not decide the
+ * gate; the newer run's own state already does. Otherwise, if no entry of that
+ * run reads bad, the snapshot is still showing an earlier attempt, and a
  * failure is injected rather than waiting for a later event that may not come.
  */
 function withTriggeringRun(entries, run, keep = () => true) {
@@ -981,6 +1011,11 @@ function withTriggeringRun(entries, run, keep = () => true) {
   if (OK_CONCLUSIONS.has(run.conclusion)) return entries;
   const mine = entries.filter((entry) => String(entry.workflowRunId) === run.runId);
   if (mine.some((entry) => classify(entry) === 'bad')) return entries;
+  const key = workflowKey(run);
+  const supersededByNewerRun = key !== '' && entries.some(
+    (entry) => workflowKey(entry) === key && isNewerRun(entry, run)
+  );
+  if (supersededByNewerRun) return entries;
   const projected = {
     projected: true,
     name: '(run did not pass)',
@@ -1474,18 +1509,18 @@ function warnConflictingWaitFor(all, skipOpts, waitFor) {
  * projection to drop the suite it supersedes.
  */
 function latestSuitePerWorkflow(entries) {
-  const key = (entry) => path.basename(entry.workflowPath || '') || entry.workflowName || '';
   const newestByWorkflow = new Map();
   for (const entry of entries) {
+    const key = workflowKey(entry);
     const createdMs = Date.parse(entry.suiteCreatedAt || '');
     const rank = Number.isFinite(createdMs) ? createdMs : -Infinity;
     const runId = Number(entry.workflowRunId) || 0;
-    const current = newestByWorkflow.get(key(entry));
+    const current = newestByWorkflow.get(key);
     if (!current || rank > current.rank || (rank === current.rank && runId > current.runId)) {
-      newestByWorkflow.set(key(entry), { rank, runId });
+      newestByWorkflow.set(key, { rank, runId });
     }
   }
-  return entries.filter((entry) => (Number(entry.workflowRunId) || 0) === newestByWorkflow.get(key(entry)).runId);
+  return entries.filter((entry) => (Number(entry.workflowRunId) || 0) === newestByWorkflow.get(workflowKey(entry)).runId);
 }
 
 /**
@@ -1722,6 +1757,7 @@ async function runWait(opts) {
 
   let polls = 0;
   let warnedUnmatchedSkips = false;
+  const announcedWaivers = new Set();
   for (let attempt = 1; attempt <= attemptLimits; attempt += 1) {
     polls = attempt;
     const waitMs = attempt === 1 ? warmupMs : pollIntervalMs(retryMethod, minimumMs, attempt);
@@ -1748,6 +1784,18 @@ async function runWait(opts) {
       notice('No other check runs visible yet. If this repo genuinely has no other jobs the gate will pass.');
     }
 
+    // A rule's own timeout is independent of whatever else is still running,
+    // so the notice fires the poll a rule expires, not the poll the whole
+    // gate happens to finish. Otherwise a still-pending sibling job (real,
+    // unrelated to the waived rule) silences the notice until it either
+    // resolves within attempt-limits or the gate times out and logs nothing.
+    for (const rule of waived) {
+      const key = JSON.stringify(rule);
+      if (announcedWaivers.has(key)) continue;
+      announcedWaivers.add(key);
+      notice(`wait-for rule ${key} never appeared before wait-for-timeout, and was let through by wait-for-timeout-conclusion: success.`);
+    }
+
     if (!result.done) {
       log(`  ${result.pending.length} still running.`);
       continue;
@@ -1757,9 +1805,6 @@ async function runWait(opts) {
 
     if (result.ok) {
       setOutput('conclusion', 'success');
-      for (const rule of waived) {
-        notice(`wait-for rule ${JSON.stringify(rule)} never appeared before wait-for-timeout, and was let through by wait-for-timeout-conclusion: success.`);
-      }
       log('All watched jobs passed.');
       return 0;
     }
@@ -1819,6 +1864,8 @@ module.exports = {
   inFlightEntry,
   withTriggeringRun,
   triggeringWorkflowRun,
+  workflowKey,
+  isNewerRun,
   placeholderEntry,
   waitForDeadlineMs,
   waitForEntries,
