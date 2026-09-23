@@ -967,6 +967,22 @@ function workflowKey(entryOrRun) {
 }
 
 /**
+ * Returns true if entry represents a newer run than run.
+ * Ranked by timestamp (suiteCreatedAt vs startedAtMs), breaking ties on higher workflowRunId.
+ */
+function isNewerRun(entry, run) {
+  const entryMs = Date.parse(entry.suiteCreatedAt || '');
+  const entryRank = Number.isFinite(entryMs) ? entryMs : -Infinity;
+  const entryRunId = Number(entry.workflowRunId) || 0;
+
+  const runMs = Number(run.startedAtMs);
+  const runRank = Number.isFinite(runMs) ? runMs : -Infinity;
+  const runId = Number(run.runId) || 0;
+
+  return entryRank > runRank || (entryRank === runRank && entryRunId > runId);
+}
+
+/**
  * The run that woke the gate, as the event describes it rather than as the check
  * runs currently do.
  *
@@ -975,14 +991,12 @@ function workflowKey(entryOrRun) {
  * verdict saying the commit is finished.
  *
  * Finished and not passing: the payload's conclusion is the truth, unless
- * `entries` (already deduped to one survivor per workflow by
- * `latestSuitePerWorkflow`) already holds a different run's entry for the same
- * workflow. That survivor is by construction newer, so `run` was superseded,
- * typically by a `cancel-in-progress` concurrency group re-triggered before it
- * finished, and its stale conclusion must not decide the gate; the survivor's
- * own state already does. Otherwise, if no entry of that run reads bad, the
- * snapshot is still showing an earlier attempt, and a failure is injected
- * rather than waiting for a later event that may not come.
+ * `entries` contains a newer run for the same workflow. That newer run
+ * supersedes `run`, typically when a `cancel-in-progress` concurrency group was
+ * re-triggered before it finished, and its stale conclusion must not decide the
+ * gate; the newer run's own state already does. Otherwise, if no entry of that
+ * run reads bad, the snapshot is still showing an earlier attempt, and a
+ * failure is injected rather than waiting for a later event that may not come.
  */
 function withTriggeringRun(entries, run, keep = () => true) {
   if (!run) return entries;
@@ -999,7 +1013,7 @@ function withTriggeringRun(entries, run, keep = () => true) {
   if (mine.some((entry) => classify(entry) === 'bad')) return entries;
   const key = workflowKey(run);
   const supersededByNewerRun = key !== '' && entries.some(
-    (entry) => workflowKey(entry) === key && String(entry.workflowRunId) !== run.runId
+    (entry) => workflowKey(entry) === key && isNewerRun(entry, run)
   );
   if (supersededByNewerRun) return entries;
   const projected = {
@@ -1850,6 +1864,8 @@ module.exports = {
   inFlightEntry,
   withTriggeringRun,
   triggeringWorkflowRun,
+  workflowKey,
+  isNewerRun,
   placeholderEntry,
   waitForDeadlineMs,
   waitForEntries,
