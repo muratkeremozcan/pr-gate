@@ -261,6 +261,54 @@ describe('watch mode publishes a failure when it cannot compute a verdict', () =
     assert.strictEqual(last.output.title, 'Gate could not compute a verdict');
   });
 
+  test('does not overwrite a successfully written final verdict when subsequent lookup rejects', async () => {
+    const written = [];
+    let lookupShouldFail = false;
+    global.fetch = async (url, init) => {
+      const target = String(url);
+      if (target.endsWith('/graphql')) {
+        return res({
+          data: {
+            repository: {
+              object: {
+                checkSuites: {
+                  pageInfo: { hasNextPage: false },
+                  nodes: [{
+                    id: 'S',
+                    createdAt: '2026-10-01T00:00:00Z',
+                    workflowRun: { databaseId: 1, workflow: { name: 'CI', resourcePath: '/o/r/actions/workflows/ci.yml' } },
+                    checkRuns: {
+                      totalCount: 1,
+                      pageInfo: { hasNextPage: false },
+                      nodes: [{ name: 'unit', status: 'COMPLETED', conclusion: 'SUCCESS', detailsUrl: 'u', externalId: '', startedAt: '2026-10-01T00:00:00Z' }],
+                    },
+                  }],
+                },
+              },
+            },
+          },
+        });
+      }
+      if (init.method === 'GET') {
+        if (lookupShouldFail) {
+          return { ok: false, status: 500, headers: new Headers(), text: async () => 'lookup failed' };
+        }
+        return res({ check_runs: [], total_count: 0 });
+      }
+      written.push({ method: init.method, body: JSON.parse(init.body) });
+      lookupShouldFail = true;
+      return res({});
+    };
+    const out = captureStdout();
+    try {
+      await assert.rejects(() => gate.runWatch(opts({ publish: 'check-run' })), /lookup failed/);
+    } finally {
+      out.restore();
+    }
+    assert.strictEqual(written.length, 1);
+    assert.strictEqual(written[0].body.conclusion, 'success');
+  });
+
   test('the failure verdicts name the error and stay inside a status description', () => {
     const status = gate.errorStatus('gate', 'x'.repeat(500));
     assert.strictEqual(status.state, 'failure');

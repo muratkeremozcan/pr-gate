@@ -1424,8 +1424,9 @@ function checkRunPublisher(ctx, name) {
       }
       return existing;
     },
-    async write(existing, verdict) {
+    async write(existing, verdict, onPublished) {
       const { created, id } = await writeCheckRun(ctx, verdict, existing);
+      if (typeof onPublished === 'function') onPublished();
       // Hands back the check run it just wrote, so a caller that writes twice
       // updates the second time instead of creating again. The id comes from the
       // write itself and not from a fresh lookup: the check-runs list is not
@@ -1467,11 +1468,12 @@ function commitStatusPublisher(ctx, context) {
       log('Moved the context to pending before recomputing, so a failed write cannot leave a stale verdict.');
       return null;
     },
-    async write(_handle, verdict) {
+    async write(_handle, verdict, onPublished) {
       // The markdown a check run carries as its summary has nowhere to go on a
       // status. It goes to the job summary, which is what target_url points at.
       appendStepSummary(`## ${verdict.title}\n\n${verdict.summary}\n`);
       await writeCommitStatus(ctx, verdict, targetUrl);
+      if (typeof onPublished === 'function') onPublished();
       // No handle to carry: a status has no id, and posting one supersedes
       // whatever held the context before, so writing twice cannot duplicate it.
       return { note: 'Published', handle: null };
@@ -1757,13 +1759,16 @@ async function runWatch(opts) {
     return 0;
   }
 
+  let publishedFinal = false;
   try {
-    return await recomputeAndPublish(opts, publisher, reportDropped);
+    return await recomputeAndPublish(opts, publisher, reportDropped, () => {
+      publishedFinal = true;
+    });
   } catch (err) {
     // prepare() has usually already moved the context to pending, and no sibling job is going to fire another event for a gate whose own run died.
     // Publish a failure so the context does not sit pending until someone notices.
     // Best effort: if this write fails too the context stays pending, which blocks the merge.
-    if (!dryRun) await publishComputeFailure(publisher, err, checkName);
+    if (!dryRun && !publishedFinal) await publishComputeFailure(publisher, err, checkName);
     throw err;
   }
 }
@@ -1780,7 +1785,7 @@ async function publishComputeFailure(publisher, err, checkName) {
 }
 
 /** The part of watch mode that reads the commit and writes the verdict, split out so runWatch can publish a failure when it throws. */
-async function recomputeAndPublish(opts, publisher, reportDropped) {
+async function recomputeAndPublish(opts, publisher, reportDropped, onPublished) {
   const {
     ctx, checkName, publish, skipOpts, dryRun, warmupMs,
     waitFor, minimumMs, attemptLimits, waitForTimeoutSec,
@@ -1909,7 +1914,7 @@ async function recomputeAndPublish(opts, publisher, reportDropped) {
     return 0;
   }
 
-  const { note } = await publisher.write(handle, verdict);
+  const { note } = await publisher.write(handle, verdict, onPublished);
   log(`${note} ${publisher.label} "${checkName}": ${publisher.describe(verdict)}`);
   return 0;
 }
