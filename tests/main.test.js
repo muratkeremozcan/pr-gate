@@ -61,9 +61,16 @@ describe('classify', () => {
       assert.strictEqual(gate.classify({ status: 'COMPLETED', conclusion }), 'ok');
     });
   }
-  for (const conclusion of ['FAILURE', 'CANCELLED', 'TIMED_OUT', 'ACTION_REQUIRED', 'STALE', 'STARTUP_FAILURE']) {
+  for (const conclusion of ['FAILURE', 'CANCELLED', 'TIMED_OUT', 'STALE', 'STARTUP_FAILURE']) {
     test(`completed/${conclusion} is bad`, () => {
       assert.strictEqual(gate.classify({ status: 'COMPLETED', conclusion }), 'bad');
+    });
+  }
+  for (const conclusion of ['ACTION_REQUIRED', 'action_required']) {
+    test(`completed/${conclusion} is pending, because a person still has to approve the run`, () => {
+      // Approving the run fires a workflow_run event, so pending resolves itself.
+      // Bad would leave a red gate nothing clears; ok would merge unreviewed code.
+      assert.strictEqual(gate.classify({ status: 'COMPLETED', conclusion }), 'pending');
     });
   }
   test('completed with an unknown conclusion is bad, not ok', () => {
@@ -349,7 +356,7 @@ describe('setOutput', () => {
     const saved = process.env.GITHUB_OUTPUT;
     delete process.env.GITHUB_OUTPUT;
     try {
-      gate.setOutput('polls', '3');
+      assert.doesNotThrow(() => assert.strictEqual(gate.setOutput('polls', '3'), undefined));
     } finally {
       if (saved !== undefined) process.env.GITHUB_OUTPUT = saved;
     }
@@ -450,7 +457,7 @@ describe('graphql: API errors are retried, real errors are not', () => {
     };
     const data = await gate.graphql(ctx);
     assert.strictEqual(calls, 3);
-    assert.ok(data.repository);
+    assert.deepStrictEqual(data, okBody.data);
   });
 
   test('a 401 fails immediately without burning retries', async () => {
@@ -472,7 +479,7 @@ describe('graphql: API errors are retried, real errors are not', () => {
     };
     const data = await gate.graphql(ctx);
     assert.strictEqual(calls, 3);
-    assert.ok(data.repository);
+    assert.deepStrictEqual(data, okBody.data);
   });
 
   test('retries are bounded and then surface the failure', async () => {

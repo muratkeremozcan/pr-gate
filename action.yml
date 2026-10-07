@@ -29,6 +29,12 @@ description: |
   commit status with `publish: status`, costing seconds per event instead of
   minutes of idling.
 
+  `success`, `skipped` and `neutral` pass. `action_required` is pending until a
+  person approves the run. Every other completed conclusion fails, including
+  `cancelled`, `timed_out` and any conclusion GitHub adds later. Check suites from
+  non-Actions GitHub Apps (Vercel, GitGuardian) are not judged, and the verdict
+  summary names them.
+
   Copy-paste workflows for both modes are in pr-gate/README.md. They are not
   repeated here, because Actions evaluates expression syntax anywhere in this file
   including inside a description, and the watch-mode example needs an expression

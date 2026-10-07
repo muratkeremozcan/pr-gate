@@ -116,10 +116,22 @@ function parsePublish(raw) {
 
 const OK_CONCLUSIONS = new Set(['success', 'skipped', 'neutral']);
 
-/** 'pending' | 'ok' | 'bad'. Anything completed and not explicitly OK is bad. */
+/**
+ * Completed, but waiting for a person to approve the run.
+ * Approving it fires a workflow_run event that recomputes the verdict, so pending clears itself.
+ */
+const AWAITING_APPROVAL = 'action_required';
+
+/**
+ * 'pending' | 'ok' | 'bad'.
+ * `success`, `skipped` and `neutral` pass, and `action_required` is pending.
+ * Every other completed conclusion fails, including ones GitHub adds later.
+ */
 function classify(entry) {
   if (String(entry.status || '').toUpperCase() !== 'COMPLETED') return 'pending';
-  return OK_CONCLUSIONS.has(String(entry.conclusion || '').toLowerCase()) ? 'ok' : 'bad';
+  const conclusion = String(entry.conclusion || '').toLowerCase();
+  if (conclusion === AWAITING_APPROVAL) return 'pending';
+  return OK_CONCLUSIONS.has(conclusion) ? 'ok' : 'bad';
 }
 
 /**
@@ -314,8 +326,9 @@ function formatEntry(entry) {
   // stateLabel is for entries whose real state would misdescribe them: a
   // placeholder for a job that has not registered would otherwise read `queued`,
   // which is what a job that GitHub has actually accepted reads.
+  const awaitingApproval = String(entry.conclusion || '').toLowerCase() === AWAITING_APPROVAL;
   const state = entry.stateLabel || (classify(entry) === 'pending'
-    ? String(entry.status || '').toLowerCase()
+    ? (awaitingApproval ? 'waiting for approval' : String(entry.status || '').toLowerCase())
     : String(entry.conclusion || '').toLowerCase());
   return `${entry.workflowName || '(unknown workflow)'} / ${entry.name}: ${state}`;
 }
@@ -428,6 +441,23 @@ function formatRule(rule) {
 const ruleList = (heading, rules) => bulletList(heading, rules, formatRule);
 
 /**
+ * Names the check suites the gate cannot see, for the verdict summary.
+ * Vercel, GitGuardian and other non-Actions GitHub Apps publish check runs with no workflow run, so the gate cannot wait on or judge them.
+ * CI that reports only commit statuses is invisible by the same rule, and the note says so.
+ */
+function excludedNote(excluded) {
+  if (!Array.isArray(excluded) || excluded.length === 0) return '';
+  return [
+    bulletList(
+      'Not part of this verdict. These come from GitHub Apps, which the gate cannot wait on. Require them in the ruleset if they matter:',
+      excluded,
+      (name) => name
+    ),
+    'CI that reports only commit statuses is not listed; the gate cannot see it.',
+  ].join('\n\n');
+}
+
+/**
  * The check run body for a verdict, for watch mode.
  *
  * A `done` verdict becomes a terminal conclusion. Anything else stays
@@ -435,8 +465,9 @@ const ruleList = (heading, rules) => bulletList(heading, rules, formatRule);
  * blocking the merge. That is the fail-closed direction: a gate that never hears
  * about the last sibling leaves the PR unmergeable rather than mergeable.
  */
-function verdictCheckRun(result, { name, totalWatched, waived = [] }) {
+function verdictCheckRun(result, { name, totalWatched, waived = [], excluded = [] }) {
   const awaited = (list) => list.filter((entry) => entry.placeholder);
+  const withExcluded = (summary) => [summary, excludedNote(excluded)].filter(Boolean).join('\n\n');
 
   if (!result.done) {
     const expected = awaited(result.pending);
@@ -449,20 +480,20 @@ function verdictCheckRun(result, { name, totalWatched, waived = [] }) {
         name,
         status: 'in_progress',
         title: `Waiting for ${expected.length} expected job(s) to start`,
-        summary: entryList(
+        summary: withExcluded(entryList(
           'Every other job on this commit finished. These are listed in `wait-for` and have not registered a check run yet:',
           expected
-        ),
+        )),
       };
     }
     return {
       name,
       status: 'in_progress',
       title: `Waiting on ${result.pending.length} of ${totalWatched} job(s)`,
-      summary: [
+      summary: withExcluded([
         entryList('Still running:', running),
         expected.length > 0 ? entryList('Expected, not started yet:', expected) : '',
-      ].filter(Boolean).join('\n\n'),
+      ].filter(Boolean).join('\n\n')),
     };
   }
 
@@ -472,7 +503,7 @@ function verdictCheckRun(result, { name, totalWatched, waived = [] }) {
       status: 'completed',
       conclusion: 'success',
       title: `All ${totalWatched} watched job(s) passed`,
-      summary: [
+      summary: withExcluded([
         totalWatched === 0
           ? 'No other check runs on this commit, so there was nothing to gate.'
           : 'Every watched check run on this commit finished and passed.',
@@ -483,7 +514,7 @@ function verdictCheckRun(result, { name, totalWatched, waived = [] }) {
             waived
           )
           : '',
-      ].filter(Boolean).join('\n\n'),
+      ].filter(Boolean).join('\n\n')),
     };
   }
 
@@ -494,10 +525,10 @@ function verdictCheckRun(result, { name, totalWatched, waived = [] }) {
       status: 'completed',
       conclusion: 'failure',
       title: `${expected.length} expected job(s) never started`,
-      summary: entryList(
+      summary: withExcluded(entryList(
         'Listed in `wait-for`, but no matching check run appeared on this commit before `wait-for-timeout` ran out:',
         expected
-      ),
+      )),
     };
   }
   return {
@@ -505,7 +536,7 @@ function verdictCheckRun(result, { name, totalWatched, waived = [] }) {
     status: 'completed',
     conclusion: 'failure',
     title: `${result.bad.length} job(s) did not pass`,
-    summary: entryList('Failed:', result.bad),
+    summary: withExcluded(entryList('Failed:', result.bad)),
   };
 }
 
@@ -563,8 +594,8 @@ function statusState(checkRun) {
  * reads as unfinished, so a gate that never hears about the last sibling leaves
  * the pull request unmergeable rather than mergeable.
  */
-function verdictStatus(result, { context, totalWatched, waived = [] }) {
-  const checkRun = verdictCheckRun(result, { name: context, totalWatched, waived });
+function verdictStatus(result, { context, totalWatched, waived = [], excluded = [] }) {
+  const checkRun = verdictCheckRun(result, { name: context, totalWatched, waived, excluded });
   return {
     context,
     state: statusState(checkRun),
@@ -889,10 +920,19 @@ function readEventPayload(env = process.env) {
 }
 
 /**
+ * Events where GITHUB_SHA is not the commit the check runs hang off.
+ * It is the merge commit on pull_request, the base tip on pull_request_target and the default branch tip on workflow_run, and each has green checks of its own.
+ */
+const PAYLOAD_SHA_EVENTS = new Set(['pull_request', 'pull_request_target', 'workflow_run']);
+
+/**
  * On pull_request the head SHA carries the check runs; GITHUB_SHA is the merge
  * commit. On workflow_run it is worse: GITHUB_SHA is the tip of the default
  * branch and GITHUB_REF is the default branch, neither of which has anything to
  * do with the PR being gated, so the head SHA must come from the payload.
+ *
+ * On the events in PAYLOAD_SHA_EVENTS an unreadable payload throws.
+ * The old fallback published a verdict for the default branch tip onto the pull request, which then merged on master's green checks.
  */
 function resolveSha(env = process.env) {
   const explicit = getInput('ref', env);
@@ -900,6 +940,13 @@ function resolveSha(env = process.env) {
   const payload = readEventPayload(env);
   const head = payload?.pull_request?.head?.sha || payload?.workflow_run?.head_sha;
   if (head) return head;
+  const event = String(env.GITHUB_EVENT_NAME || '');
+  if (PAYLOAD_SHA_EVENTS.has(event)) {
+    throw new Error(
+      `could not read the head SHA from the ${event} event payload, and GITHUB_SHA is the wrong commit on this event. ` +
+        'Re-run the workflow.'
+    );
+  }
   return env.GITHUB_SHA || '';
 }
 
@@ -1094,6 +1141,32 @@ function externalIdFor(checkName) {
   return `muratkeremozcan/pr-gate:${checkName}`;
 }
 
+const CHECK_RUNS_PER_PAGE = 100;
+// Bounds the loop if the API stops reporting a last page.
+// The API does not promise newest-first, so a commit with more than this many same-named runs could still miss the owned one.
+const MAX_CHECK_RUN_PAGES = 10;
+
+/**
+ * Every check run of one name on the commit, across pages.
+ * A lookup that misses the owned check run on page one creates a second one with the same required context.
+ */
+async function listCheckRunsNamed(ctx, name) {
+  const runs = [];
+  for (let page = 1; page <= MAX_CHECK_RUN_PAGES; page += 1) {
+    const found = await rest(
+      ctx,
+      'GET',
+      `/repos/${ctx.owner}/${ctx.repo}/commits/${encodeURIComponent(ctx.sha)}/check-runs` +
+        `?check_name=${encodeURIComponent(name)}&filter=all&per_page=${CHECK_RUNS_PER_PAGE}&page=${page}`
+    );
+    const batch = (found?.check_runs || []).filter(Boolean);
+    runs.push(...batch);
+    const total = Number(found?.total_count);
+    if (batch.length < CHECK_RUNS_PER_PAGE || (Number.isFinite(total) && runs.length >= total)) break;
+  }
+  return runs;
+}
+
 /**
  * Finds the check run this action owns on the commit, or null on the first event.
  *
@@ -1108,13 +1181,7 @@ async function findOwnedCheckRun(ctx, name) {
   // suite, so rerunning any workflow can hide the check run this action already
   // owns; the lookup then finds nothing and creates a second one of the same
   // required name, which is exactly what owning it is supposed to prevent.
-  const found = await rest(
-    ctx,
-    'GET',
-    `/repos/${ctx.owner}/${ctx.repo}/commits/${encodeURIComponent(ctx.sha)}/check-runs` +
-      `?check_name=${encodeURIComponent(name)}&filter=all&per_page=100`
-  );
-  const sameName = (found?.check_runs || []).filter(Boolean);
+  const sameName = await listCheckRunsNamed(ctx, name);
   // Newest first, because commits gated before this fix can already carry
   // duplicates and GitHub takes the most recently updated one as the status
   // context. Writing to any other would leave the required check on a stale value.
@@ -1159,6 +1226,35 @@ function invalidationStatus(context) {
     context,
     state: 'pending',
     description: 'Recomputing: a CI workflow finished and the previous verdict no longer applies',
+  };
+}
+
+/**
+ * The body published when the gate could not compute a verdict at all.
+ * A broken gate and a failed job need different reactions, so the title says which.
+ */
+function errorCheckRun(name, message) {
+  return {
+    name,
+    status: 'completed',
+    conclusion: 'failure',
+    title: 'Gate could not compute a verdict',
+    summary:
+      'The gate failed while reading or writing this commit. No job on the commit is implicated.\n\n' +
+      `Error: ${codeSpan(String(message).slice(0, 300))}\n\n` +
+      'The next workflow event on this commit recomputes the verdict. To retry now, re-run the failed PR Gate job.',
+  };
+}
+
+/** The same failure, as a commit status. */
+function errorStatus(context, message) {
+  const checkRun = errorCheckRun(context, message);
+  return {
+    context,
+    state: 'failure',
+    description: truncateForStatus(`${checkRun.title}: ${plainText(message)}`),
+    title: checkRun.title,
+    summary: checkRun.summary,
   };
 }
 
@@ -1229,6 +1325,47 @@ async function writeCommitStatus(ctx, verdict, targetUrl) {
   });
 }
 
+// GitHub rejects the 1001st status for one commit and context with a 422, and the gate cannot publish on that commit after.
+const STATUS_ROW_CAP = 1000;
+// Early enough to push a new commit in time; an ordinary pull request writes two rows per event and stays far below.
+const STATUS_ROW_WARN_AT = 800;
+const STATUS_PAGES = 10;
+
+/**
+ * How many status rows the commit carries for one context.
+ * The list is newest first at 100 per page, so heavy traffic from other contexts can use up all the pages before older rows of this one.
+ * The count is then a lower bound, and the warning comes late.
+ */
+async function countContextStatuses(ctx, context) {
+  let count = 0;
+  for (let page = 1; page <= STATUS_PAGES; page += 1) {
+    const rows = await rest(
+      ctx,
+      'GET',
+      `/repos/${ctx.owner}/${ctx.repo}/commits/${encodeURIComponent(ctx.sha)}/statuses?per_page=100&page=${page}`
+    );
+    if (!Array.isArray(rows)) break;
+    count += rows.filter((row) => row && row.context === context).length;
+    if (rows.length < 100) break;
+  }
+  return count;
+}
+
+/** Warns when the commit nears the status cap. A failed count is swallowed, so it cannot fail a gate that was about to publish. */
+async function warnNearStatusCap(ctx, context) {
+  try {
+    const used = await countContextStatuses(ctx, context);
+    if (used < STATUS_ROW_WARN_AT) return used;
+    warn(
+      `${ctx.sha} already carries at least ${used} of ${STATUS_ROW_CAP} status rows for "${context}". Each event writes two. ` +
+        'Past the cap GitHub rejects the write and the gate can no longer publish on this commit; push a new commit before then.'
+    );
+    return used;
+  } catch {
+    return null;
+  }
+}
+
 /** Where a status sends the reader for the detail its description cannot hold. */
 function workflowRunUrl(env = process.env) {
   const server = String(env.GITHUB_SERVER_URL || 'https://github.com').replace(/\/+$/, '');
@@ -1272,8 +1409,10 @@ function appendStepSummary(markdown) {
 function checkRunPublisher(ctx, name) {
   return {
     label: 'check run',
-    verdictFor: (result, totalWatched, waived) => verdictCheckRun(result, { name, totalWatched, waived }),
+    verdictFor: (result, totalWatched, waived, excluded) =>
+      verdictCheckRun(result, { name, totalWatched, waived, excluded }),
     bypassFor: (bypass) => bypassCheckRun(name, bypass),
+    errorFor: (message) => errorCheckRun(name, message),
     describe: (verdict) =>
       `${verdict.status}${verdict.conclusion ? `/${verdict.conclusion}` : ''}: ${verdict.title}`,
     locate: () => findOwnedCheckRun(ctx, name),
@@ -1285,8 +1424,9 @@ function checkRunPublisher(ctx, name) {
       }
       return existing;
     },
-    async write(existing, verdict) {
+    async write(existing, verdict, onPublished) {
       const { created, id } = await writeCheckRun(ctx, verdict, existing);
+      if (typeof onPublished === 'function') onPublished();
       // Hands back the check run it just wrote, so a caller that writes twice
       // updates the second time instead of creating again. The id comes from the
       // write itself and not from a fresh lookup: the check-runs list is not
@@ -1306,14 +1446,18 @@ function commitStatusPublisher(ctx, context) {
   const targetUrl = workflowRunUrl();
   return {
     label: 'commit status',
-    verdictFor: (result, totalWatched, waived) => verdictStatus(result, { context, totalWatched, waived }),
+    verdictFor: (result, totalWatched, waived, excluded) =>
+      verdictStatus(result, { context, totalWatched, waived, excluded }),
     bypassFor: (bypass) => bypassStatus(context, bypass),
+    errorFor: (message) => errorStatus(context, message),
     describe: (verdict) => `${verdict.state}: ${verdict.description}`,
     // Nothing to read: there is no id to keep and no foreign owner to refuse,
     // because a status has no external_id and posting one supersedes whatever
     // held the context before.
     locate: async () => null,
     async prepare() {
+      // Past the cap this write is the one that fails, so warn first.
+      await warnNearStatusCap(ctx, context);
       // Posted unconditionally, where the check-run path only invalidates a
       // verdict it found to be terminal. Reading the combined status first to
       // make that same distinction would cost the call this write costs, and
@@ -1324,11 +1468,12 @@ function commitStatusPublisher(ctx, context) {
       log('Moved the context to pending before recomputing, so a failed write cannot leave a stale verdict.');
       return null;
     },
-    async write(_handle, verdict) {
+    async write(_handle, verdict, onPublished) {
       // The markdown a check run carries as its summary has nowhere to go on a
       // status. It goes to the job summary, which is what target_url points at.
       appendStepSummary(`## ${verdict.title}\n\n${verdict.summary}\n`);
       await writeCommitStatus(ctx, verdict, targetUrl);
+      if (typeof onPublished === 'function') onPublished();
       // No handle to carry: a status has no id, and posting one supersedes
       // whatever held the context before, so writing twice cannot duplicate it.
       return { note: 'Published', handle: null };
@@ -1428,16 +1573,23 @@ function buildOptions() {
   };
 }
 
-/** Reports each non-Actions check suite it had to drop, once per name. */
+/**
+ * Reports each non-Actions check suite it had to drop, once per name.
+ * It keeps them in `.excluded` so the verdict summary can name them.
+ * The `seen` set is what keeps `.excluded` free of duplicates across polls, so change the two together.
+ */
 function droppedReporter() {
   const seen = new Set();
-  return (names) => {
+  const reporter = (names) => {
     for (const name of names) {
       if (seen.has(name)) continue;
       seen.add(name);
+      reporter.excluded.push(name);
       notice(`Ignoring "${name}": its check suite has no workflow run, so it is not a job this gate can wait on`);
     }
   };
+  reporter.excluded = [];
+  return reporter;
 }
 
 /**
@@ -1570,8 +1722,8 @@ function awaitingArrivalOnly(result) {
  */
 async function runWatch(opts) {
   const {
-    ctx, checkName, publish, headBranch, bypassPrefix, skipOpts, dryRun, warmupMs,
-    waitFor, triggeringRun, minimumMs, attemptLimits, waitForTimeoutSec,
+    ctx, checkName, publish, headBranch, bypassPrefix, skipOpts, dryRun,
+    waitFor, triggeringRun, waitForTimeoutSec,
   } = opts;
   const reportDropped = droppedReporter();
   const publisher = publish === 'status'
@@ -1607,6 +1759,37 @@ async function runWatch(opts) {
     return 0;
   }
 
+  let publishedFinal = false;
+  try {
+    return await recomputeAndPublish(opts, publisher, reportDropped, () => {
+      publishedFinal = true;
+    });
+  } catch (err) {
+    // prepare() has usually already moved the context to pending, and no sibling job is going to fire another event for a gate whose own run died.
+    // Publish a failure so the context does not sit pending until someone notices.
+    // Best effort: if this write fails too the context stays pending, which blocks the merge.
+    if (!dryRun && !publishedFinal) await publishComputeFailure(publisher, err, checkName);
+    throw err;
+  }
+}
+
+/** Publishes a failure saying the gate broke, and why. Never throws, because the caller's error is the one to report. */
+async function publishComputeFailure(publisher, err, checkName) {
+  try {
+    const message = err && err.message ? err.message : String(err);
+    await publisher.write(await publisher.locate(), publisher.errorFor(message));
+    warn(`Could not compute a verdict (${message}). Published "${checkName}" as a failure; the next workflow event recomputes it.`);
+  } catch (writeErr) {
+    warn(`Could not publish a failure either (${writeErr && writeErr.message}). "${checkName}" stays as it was, which blocks the merge.`);
+  }
+}
+
+/** The part of watch mode that reads the commit and writes the verdict, split out so runWatch can publish a failure when it throws. */
+async function recomputeAndPublish(opts, publisher, reportDropped, onPublished) {
+  const {
+    ctx, checkName, publish, skipOpts, dryRun, warmupMs,
+    waitFor, minimumMs, attemptLimits, waitForTimeoutSec,
+  } = opts;
   const assess = async () =>
     assessment(flattenCheckSuites(await fetchChecks(ctx), reportDropped), opts);
 
@@ -1653,14 +1836,13 @@ async function runWatch(opts) {
     // the same required name. Two writers on one name make the status context
     // flip between them, which is the failure ownership by external_id exists to
     // prevent.
-    ({ handle } = await publisher.write(handle, publisher.verdictFor(state.result, state.entries.length, state.waived)));
+    ({ handle } = await publisher.write(handle, publisher.verdictFor(state.result, state.entries.length, state.waived, reportDropped.excluded)));
 
     while (awaitingArrivalOnly(state.result) && polls < attemptLimits) {
-      // A null deadline means no check suite has been created on this commit at
-      // all, so the clock the timeout is measured from has not started. Holding
-      // the runner against a deadline that cannot arrive would burn the job's
-      // timeout and publish nothing.
-      if (state.deadlineMs == null) break;
+      // A null deadline means no check suite has registered yet, so the timeout clock has not started.
+      // That is normal a few seconds after a push, and failing on it publishes a red verdict for CI that has not had time to register.
+      // Keep polling at the normal interval; attempt-limits still bounds the wait.
+      //
       // Read off the last assessment, not captured once before the loop. The
       // assessment is what decides whether the deadline has passed, so a
       // separate copy here could sleep against one deadline while the loop exits
@@ -1673,11 +1855,13 @@ async function runWatch(opts) {
       // makes that safe to say. Sleeping the exact remainder would busy-loop
       // against the API for the rest of attempt-limits if the two ever disagreed,
       // and a second is nothing against a timeout measured in minutes.
-      const remainingMs = state.deadlineMs - Date.now();
+      const remainingMs = state.deadlineMs == null ? minimumMs : state.deadlineMs - Date.now();
       await sleep(Math.max(1000, Math.min(minimumMs, remainingMs)));
       polls += 1;
       state = await assess();
-      log(`Poll ${polls}: ${Math.round(Math.max(0, state.deadlineMs - Date.now()) / 1000)}s left on wait-for-timeout.`);
+      log(state.deadlineMs == null
+        ? `Poll ${polls}: no check suite has registered yet, so wait-for-timeout has not started.`
+        : `Poll ${polls}: ${Math.round(Math.max(0, state.deadlineMs - Date.now()) / 1000)}s left on wait-for-timeout.`);
     }
     for (const entry of state.entries) log(`  ${formatEntry(entry)}`);
 
@@ -1689,7 +1873,7 @@ async function runWatch(opts) {
     // too, and says which knob was too small.
     if (awaitingArrivalOnly(state.result)) {
       const reason = state.deadlineMs == null
-        ? 'no check suite exists on this commit yet, so wait-for-timeout has no clock to run against'
+        ? `no check suite registered on this commit within ${polls} of ${attemptLimits} polls, so wait-for-timeout never started`
         : `the gate ran out of polls after ${polls} of ${attemptLimits}, before wait-for-timeout elapsed. ` +
           'Raise attempt-limits or minimum-interval so their product exceeds wait-for-timeout';
       warn(`Gave up waiting for ${state.result.pending.length} expected job(s): ${reason}.`);
@@ -1720,7 +1904,7 @@ async function runWatch(opts) {
         `${new Date(state.deadlineMs - waitForTimeoutSec * 1000).toISOString()}. This pass did not check them.`
     );
   }
-  const verdict = publisher.verdictFor(result, entries.length, waived);
+  const verdict = publisher.verdictFor(result, entries.length, waived, reportDropped.excluded);
 
   setOutput('polls', String(polls));
   setOutput('conclusion', result.done ? (result.ok ? 'success' : 'failure') : 'pending');
@@ -1730,7 +1914,7 @@ async function runWatch(opts) {
     return 0;
   }
 
-  const { note } = await publisher.write(handle, verdict);
+  const { note } = await publisher.write(handle, verdict, onPublished);
   log(`${note} ${publisher.label} "${checkName}": ${publisher.describe(verdict)}`);
   return 0;
 }
@@ -1906,6 +2090,13 @@ module.exports = {
   graphql,
   rest,
   upsertCheckRun,
+  errorCheckRun,
+  errorStatus,
+  excludedNote,
+  droppedReporter,
+  listCheckRunsNamed,
+  countContextStatuses,
+  warnNearStatusCap,
   // Exported for the linger test. Holding a runner is the one thing watch mode
   // is not supposed to do, so the conditions that start and end it are worth
   // asserting against a stubbed API rather than reasoning about.
