@@ -44,9 +44,15 @@ jobs:
     # Not `gate`. That name belongs to the verdict this job publishes.
     name: watch
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    # Above wait-for-timeout (30m) and above attempt-limits x minimum-interval (180 x 15s = 45m).
+    # Watch mode holds its runner while a wait-for job has not started, and a job killed mid-wait publishes nothing.
+    # Ordinary runs finish in seconds.
+    timeout-minutes: 60
     # workflow_run fires for this workflow too, so without this it triggers itself.
     if: github.event.workflow_run.path != '.github/workflows/pr-gate.yml'
+    # No other `if:` on this job.
+    # A skipped job publishes no verdict, so a guard that used to wave a branch through now blocks it.
+    # Use bypass-branch-prefixes.
     permissions:
       contents: read
       checks: read
@@ -101,6 +107,37 @@ Switching from `check-run` takes two merges. Add `statuses: write` next to
 has landed. The old `gate` check run can keep a pull request blocked until you
 push a new commit to it.
 
+## How conclusions count
+
+| Check run conclusion | Gate |
+| --- | --- |
+| `success`, `skipped`, `neutral` | passes |
+| `action_required` | pending |
+| `failure`, `cancelled`, `timed_out`, `stale`, `startup_failure`, anything new | fails |
+
+`action_required` means a person has to approve the run, as for a first-time contributor.
+The gate holds the merge until they do, and approving fires a `workflow_run` event that recomputes the verdict.
+An unapproved run, such as one from an abandoned fork pull request, keeps the gate pending until someone approves it or a new commit is pushed.
+A conclusion GitHub adds later fails, so it cannot pass a commit by accident.
+
+## What the gate does not see
+
+Check suites from GitHub Apps other than Actions, such as Vercel and GitGuardian, carry no workflow run.
+The gate cannot wait on or judge them, and the verdict summary lists each by name.
+Require them in the ruleset.
+
+CI that reports only commit statuses, with no check run, is invisible to the gate and cannot be named.
+Require its status context in the ruleset too.
+
+## When the gate itself breaks
+
+If watch mode throws while reading or writing a verdict, it publishes a failure titled "Gate could not compute a verdict" with the error, and the job fails.
+The next workflow event recomputes the verdict, and re-running the failed PR Gate job does it now.
+If the head SHA cannot be read from the event payload, nothing is published and the missing `gate` context blocks the merge.
+
+With `publish: status` the action warns once a commit reaches 800 of the 1000 status rows GitHub allows per context.
+Past 1000 the gate cannot publish, so push a new commit before then.
+
 ## Re-running a failed job is not needed
 
 Nobody has to re-run the gate; it recomputes by itself. `in_progress` in the
@@ -128,8 +165,10 @@ and a chain of late jobs each get a window. When it does run out,
 `wait-for-timeout-conclusion` decides the verdict: `failure` by default, or
 `success` for a job that may legitimately never run.
 
-Give that job more `timeout-minutes` than `wait-for-timeout`. Watch mode holds
-its runner while it waits for something that has not started.
+Give that job more `timeout-minutes` than `wait-for-timeout` and than `attempt-limits` times `minimum-interval`, as the example does.
+A job killed mid-wait publishes nothing and leaves the gate pending until the next event.
+
+While no check suite has registered on the commit, watch mode keeps polling for `attempt-limits` and does not conclude "never started" a few seconds after a push.
 
 ## Configuration
 
