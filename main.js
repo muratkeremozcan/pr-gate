@@ -432,6 +432,194 @@ function bulletList(heading, items, format) {
 
 const entryList = (heading, entries) => bulletList(heading, entries, formatEntry);
 
+/**
+ * The failed list, with a link to where each job failed when locateFailures found it.
+ * Same bound and same code spans as every other list, so the summary limit holds.
+ */
+function failedList(heading, entries) {
+  const shown = entries.slice(0, MAX_LISTED_ENTRIES);
+  const lines = shown.map((entry) => {
+    const where = entry.failure;
+    if (!where) return `- ${codeSpan(formatEntry(entry))}`;
+    const line = Number.isInteger(where.line) ? `, line ${where.line}` : '';
+    const label = plainText(`${where.step || 'job'}${line}`).replace(/[[\]]/g, '');
+    const text = where.text ? `: ${codeSpan(where.text)}` : '';
+    return `- ${codeSpan(formatEntry(entry))} failed in [${label}](${where.url})${text}`;
+  });
+  if (entries.length > shown.length) lines.push(`- and ${entries.length - shown.length} more`);
+  return [heading, ...lines].join('\n');
+}
+
+// ─── where a failed job failed ────────────────────────────────────────────────
+
+// "Failed: ci / test (1)" still sends the reader hunting through the job for the
+// one red line. Each failed job gets a link to its failed step and the first
+// failure line in its log. All of it is best effort: the verdict never waits on
+// it, and any error leaves the plain list.
+const MAX_LOCATED_JOBS = 5;
+const MAX_LOG_BYTES = 20 * 1024 * 1024;
+const LOG_TIMESTAMP = /^(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?Z ?/;
+// eslint-disable-next-line no-control-regex
+const ANSI_ESCAPE = /\u001b\[[0-9;]*[A-Za-z]/g;
+const STEP_HEADER = '##[group]Run ';
+
+// First line a reader needs, per runner. The test-level marker wins over the
+// generic error the runner prints when the step exits non-zero.
+const FAILURE_PATTERNS = [
+  /^\s*FAIL\s+\S/, // Jest and Vitest file header
+  /^\s*●\s+.+›/, // Jest test title
+  /^\s*[×✗✕]\s+\S/, // Vitest and Mocha failed test
+  /^FAILED\s+\S/, // pytest short summary
+  /^_{3,}\s+\S.*\s+_{3,}$/, // pytest failure section
+  /^---\s+FAIL:/, // go test
+  /<<<\s+(FAILURE|ERROR)!/, // Maven Surefire
+];
+
+const logSecond = (iso) => {
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? Math.floor(ms / 1000) : NaN;
+};
+
+/**
+ * The failed step's first failure line, numbered the way the job page numbers it:
+ * line 1 is the step's "Run ..." header, and ##[endgroup] is not rendered or counted.
+ * Steps are found by their timestamps because the job log has no step markers.
+ */
+function locateFailureLine(logText, step, previousStep) {
+  const lines = String(logText).split(/\r?\n/).map((raw) => {
+    const match = LOG_TIMESTAMP.exec(raw);
+    return {
+      second: match ? Date.parse(`${match[1]}Z`) / 1000 : NaN,
+      body: (match ? raw.slice(match[0].length) : raw).replace(ANSI_ESCAPE, ''),
+    };
+  });
+  const started = logSecond(step && step.started_at);
+  const completed = logSecond(step && step.completed_at);
+  if (!Number.isFinite(started) || !Number.isFinite(completed)) return null;
+
+  const headers = [];
+  lines.forEach((l, i) => {
+    if (l.body.startsWith(STEP_HEADER) && l.second >= started && l.second <= completed) headers.push(i);
+  });
+  if (headers.length === 0) return null;
+  // Step timestamps are whole seconds. When the previous step ended in the second
+  // this one started, its lines share the window, and this step's header is the
+  // last one logged in that second.
+  const sharesStart = previousStep && logSecond(previousStep.completed_at) >= started;
+  const start = sharesStart ? (headers.filter((i) => lines[i].second === started).pop() ?? headers[0]) : headers[0];
+  // The next step starts in this step's completion second, so its header closes the window.
+  let end = start;
+  while (end + 1 < lines.length && !(lines[end + 1].second > completed)) {
+    const next = lines[end + 1];
+    if (next.body.startsWith(STEP_HEADER) && next.second === completed && completed > started) break;
+    end += 1;
+  }
+
+  const find = (test) => {
+    for (let i = start + 1; i <= end; i += 1) if (test(lines[i].body)) return i;
+    return -1;
+  };
+  let failure = find((body) => FAILURE_PATTERNS.some((p) => p.test(body)));
+  if (failure === -1) failure = find((body) => body.startsWith('##[error]'));
+  if (failure === -1) return null;
+
+  let number = 0;
+  for (let i = start; i <= failure; i += 1) if (lines[i].body !== '##[endgroup]') number += 1;
+  const text = lines[failure].body.replace(/^##\[error\]/, '').trim();
+  return { line: number, text: text.length > 160 ? `${text.slice(0, 160)}…` : text };
+}
+
+// Every request in the lookup shares one deadline, so the verdict publishes on time
+// with whatever was found by then.
+const LOCATE_BUDGET_MS = 30_000;
+
+function jobApi(ctx, path, timeoutMs) {
+  const base = String(ctx.apiUrl || 'https://api.github.com').replace(/\/+$/, '');
+  return fetch(`${base}/repos/${ctx.owner}/${ctx.repo}/actions/jobs/${path}`, {
+    headers: {
+      authorization: `bearer ${ctx.token}`,
+      accept: 'application/vnd.github+json',
+      'user-agent': 'muratkeremozcan/pr-gate',
+    },
+    redirect: 'manual',
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+}
+
+/** Reads at most maxBytes of a body and cancels the rest, so a huge log cannot exhaust memory. */
+async function readCapped(res, maxBytes) {
+  if (!res.body || typeof res.body.getReader !== 'function') {
+    return Buffer.from(String(await res.text())).subarray(0, maxBytes).toString();
+  }
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  while (total < maxBytes) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value.subarray(0, maxBytes - total));
+    total += Math.min(value.length, maxBytes - total);
+  }
+  await reader.cancel().catch(() => {});
+  return new TextDecoder().decode(Buffer.concat(chunks));
+}
+
+// The job log endpoint redirects to signed storage. Following it by hand keeps
+// the token off the storage host. `remaining` is the lookup's shared budget, so
+// the download gets what the redirect left rather than a fresh timeout.
+async function readJobLog(ctx, jobId, remaining) {
+  const res = await jobApi(ctx, `${jobId}/logs`, remaining());
+  let final = res;
+  if (res.status >= 300 && res.status < 400) {
+    const location = res.headers.get('location') || '';
+    if (!location.startsWith('https://')) throw new Error('log redirect without an https location');
+    const left = remaining();
+    if (left <= 0) throw new Error('time budget ran out before the log download');
+    final = await fetch(location, { redirect: 'error', signal: AbortSignal.timeout(left) });
+  }
+  if (!final.ok) throw new Error(`job log returned ${final.status}`);
+  return readCapped(final, MAX_LOG_BYTES);
+}
+
+/**
+ * Sets `entry.failure` on the first few failed Actions jobs: the failed step, the
+ * first failure line in its log, and a link straight to that line.
+ * Needs `actions: read`, which the gate already asks for.
+ */
+async function locateFailures(ctx, entries, budgetMs = LOCATE_BUDGET_MS) {
+  const deadline = Date.now() + budgetMs;
+  const remaining = () => deadline - Date.now();
+  const located = entries
+    .filter((entry) => !entry.placeholder && /\/actions\/runs\/\d+\/job\/\d+/.test(String(entry.url || '')))
+    .slice(0, MAX_LOCATED_JOBS);
+  for (const entry of located) {
+    if (remaining() <= 0) {
+      log('Stopped locating failures: the time budget ran out.');
+      break;
+    }
+    const jobUrl = String(entry.url).replace(/[?#].*$/, '');
+    const jobId = /\/job\/(\d+)$/.exec(jobUrl)?.[1];
+    if (!jobId) continue;
+    try {
+      const res = await jobApi(ctx, jobId, remaining());
+      if (!res.ok) throw new Error(`jobs API returned ${res.status}`);
+      const job = await res.json();
+      const steps = Array.isArray(job.steps) ? job.steps : [];
+      const index = steps.findIndex((s) => s.conclusion === 'failure');
+      if (index === -1) continue;
+      const step = steps[index];
+      entry.failure = { step: step.name, line: null, text: null, url: `${jobUrl}#step:${step.number}:1` };
+      if (job.status !== 'completed') continue;
+      if (remaining() <= 0) continue;
+      const found = locateFailureLine(await readJobLog(ctx, jobId, remaining), step, steps[index - 1]);
+      if (found) entry.failure = { ...entry.failure, ...found, url: `${jobUrl}#step:${step.number}:${found.line}` };
+    } catch (err) {
+      log(`Could not locate the failure in job ${jobId} (${err.message}); listing it without a link.`);
+    }
+  }
+  return entries;
+}
+
 /** A `wait-for` rule as the caller wrote it, for a verdict that has no entry to name. */
 function formatRule(rule) {
   const job = rule.jobName ? ` / ${rule.jobName}${rule.jobMatchMode === 'prefix' ? '*' : ''}` : '';
@@ -536,7 +724,7 @@ function verdictCheckRun(result, { name, totalWatched, waived = [], excluded = [
     status: 'completed',
     conclusion: 'failure',
     title: `${result.bad.length} job(s) did not pass`,
-    summary: withExcluded(entryList('Failed:', result.bad)),
+    summary: withExcluded(failedList('Failed:', result.bad)),
   };
 }
 
@@ -1904,6 +2092,7 @@ async function recomputeAndPublish(opts, publisher, reportDropped, onPublished) 
         `${new Date(state.deadlineMs - waitForTimeoutSec * 1000).toISOString()}. This pass did not check them.`
     );
   }
+  if (result.done && !result.ok) await locateFailures(ctx, result.bad);
   const verdict = publisher.verdictFor(result, entries.length, waived, reportDropped.excluded);
 
   setOutput('polls', String(polls));
@@ -1994,7 +2183,15 @@ async function runWait(opts) {
     }
 
     setOutput('conclusion', 'failure');
-    const lines = result.bad.map((entry) => `  ${formatEntry(entry)}${entry.url ? ` (${entry.url})` : ''}`);
+    await locateFailures(ctx, result.bad);
+    const lines = result.bad.map((entry) => {
+      const where = entry.failure;
+      if (!where) return `  ${formatEntry(entry)}${entry.url ? ` (${entry.url})` : ''}`;
+      const line = Number.isInteger(where.line) ? `, line ${where.line}` : '';
+      // Step names and log text are PR-authored; flatten them so they cannot form a workflow command.
+      const text = where.text ? `: ${plainText(where.text).replace(/^:+/, '')}` : '';
+      return `  ${formatEntry(entry)} failed in ${plainText(where.step)}${line} (${where.url})${text}`;
+    });
     if (dryRun) {
       warn(`dry-run: the gate would have failed on ${result.bad.length} job(s):\n${lines.join('\n')}`);
       return 0;
@@ -2067,6 +2264,9 @@ module.exports = {
   flattenCheckSuites,
   warnLeftoverCheckRun,
   formatEntry,
+  failedList,
+  locateFailureLine,
+  locateFailures,
   codeSpan,
   plainText,
   verdictCheckRun,
