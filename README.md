@@ -9,6 +9,9 @@ pin the action to a full commit SHA.
 
 Pick a mode: **watch** costs seconds per event, **wait** is one job that blocks.
 
+A failed verdict links each failed job's failed step and the first failure line in its log, such as a Jest `FAIL` or pytest `FAILED` line.
+It needs `actions: read`, which both modes already ask for.
+
 ## Watch mode
 
 Watch mode reacts to events. Every time a workflow finishes it recomputes the

@@ -143,6 +143,22 @@ jobs:
 
           echo "${combined}" | jq -r '.[0].target_url' | grep -q "actions/runs/${GITHUB_RUN_ID}"
 
+      # Close the status out, as the check-run smoke test does. Its verdict is about
+      # whichever siblings happened to be running, and a status left pending sits on
+      # the PR forever. Statuses have no neutral state. A separate always() step
+      # closes it even when an assertion above fails, and that failure stays visible.
+      - name: Close the smoke status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/statuses/${SHA}" \
+            -f state=success -f context=gate-smoke-status \
+            -f 'description=smoke test artifact, not a verdict' \
+            -f "target_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            --silent
+
       # wait-for is the one input whose whole point is a check run that is NOT
       # there, so a stub can only prove the arithmetic. Run against this commit's
       # live check runs with a rule that can never match: first that it holds the
