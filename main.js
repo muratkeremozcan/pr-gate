@@ -590,6 +590,17 @@ async function readJobLog(ctx, jobId, remaining) {
  * Needs `actions: read`, which the gate already asks for.
  */
 async function locateFailures(ctx, entries, budgetMs = LOCATE_BUDGET_MS) {
+  // The verdict is already decided and gets published right after this call.
+  // Nothing here may throw past this point or change a conclusion.
+  try {
+    await locateEach(ctx, entries, budgetMs);
+  } catch (err) {
+    log(`Could not locate failures (${err.message}); listing jobs without links.`);
+  }
+  return entries;
+}
+
+async function locateEach(ctx, entries, budgetMs) {
   const deadline = Date.now() + budgetMs;
   const remaining = () => deadline - Date.now();
   const located = entries
@@ -620,7 +631,6 @@ async function locateFailures(ctx, entries, budgetMs = LOCATE_BUDGET_MS) {
       log(`Could not locate the failure in job ${jobId} (${err.message}); listing it without a link.`);
     }
   }
-  return entries;
 }
 
 /** A `wait-for` rule as the caller wrote it, for a verdict that has no entry to name. */

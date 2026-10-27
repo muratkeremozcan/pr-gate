@@ -255,3 +255,33 @@ describe('locateFailures time budget', () => {
     assert.ok(jobIds.size <= 5);
   });
 });
+
+describe('locateFailures never breaks the verdict', () => {
+  const originalFetch = global.fetch;
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  test('a throwing fetch, a malformed job body or a hostile entry list leaves the entries as they were', async () => {
+    global.fetch = async (url) => {
+      if (url.endsWith('/actions/jobs/100')) return { ok: true, status: 200, json: async () => null, headers: { get: () => null } };
+      throw new TypeError('fetch failed');
+    };
+    const entries = [failedEntry(), { ...failedEntry(), url: 'https://github.com/o/r/actions/runs/1/job/101' }, null];
+    const result = await gate.locateFailures(CTX, entries);
+    assert.strictEqual(result, entries);
+    assert.strictEqual(entries[0].failure, undefined);
+    assert.strictEqual(entries[1].failure, undefined);
+  });
+
+  test('a failed verdict still publishes failure with the plain list when every lookup fails', async () => {
+    global.fetch = async () => {
+      throw new TypeError('fetch failed');
+    };
+    const bad = [failedEntry()];
+    await gate.locateFailures(CTX, bad);
+    const verdict = gate.verdictCheckRun({ done: true, ok: false, pending: [], bad }, { name: 'gate', totalWatched: 2 });
+    assert.strictEqual(verdict.conclusion, 'failure');
+    assert.strictEqual(verdict.summary, 'Failed:\n- `Check PR / test (1): failure`');
+  });
+});
