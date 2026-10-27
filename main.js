@@ -502,6 +502,9 @@ function locateFailureLine(logText, step, previousStep) {
     if (l.body.startsWith(STEP_HEADER) && l.second >= started && l.second <= completed) headers.push(i);
   });
   if (headers.length === 0) return null;
+  // A step that starts and ends in one second cannot be told apart from the steps
+  // that share that second, so the caller links the step without a line.
+  if (started === completed && headers.length > 1) return null;
   // Step timestamps are whole seconds. When the previous step ended in the second
   // this one started, its lines share the window, and this step's header is the
   // last one logged in that second.

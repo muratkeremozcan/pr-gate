@@ -46,6 +46,17 @@ describe('locateFailureLine', () => {
     assert.strictEqual(gate.locateFailureLine(LOG, { ...TEST, started_at: null }, SEED), null);
     assert.strictEqual(gate.locateFailureLine('2026-10-23T13:40:26.0Z ##[group]Run x\n2026-10-23T13:40:27.0Z ok', TEST, null), null);
   });
+
+  test('returns null when a step starts and ends in the same second with multiple headers', () => {
+    const log = [
+      '2026-10-23T13:40:26.100Z ##[group]Run previous',
+      '2026-10-23T13:40:26.200Z ##[endgroup]',
+      '2026-10-23T13:40:26.300Z ##[group]Run failed-fast',
+      '2026-10-23T13:40:26.400Z ##[error]failed immediately',
+    ].join('\n');
+    const step = { number: 2, name: 'failed-fast', started_at: '2026-10-23T13:40:26Z', completed_at: '2026-10-23T13:40:26Z', conclusion: 'failure' };
+    assert.strictEqual(gate.locateFailureLine(log, step, null), null);
+  });
 });
 
 const JOB_URL = 'https://github.com/o/r/actions/runs/1/job/100';
