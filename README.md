@@ -4,6 +4,9 @@
 Require that one check in the branch ruleset and adding, renaming or removing a
 CI job never needs a branch-protection edit again.
 
+Manual `workflow_dispatch` runs are excluded by default.
+A manual run against another environment cannot change the verdict for automatic CI on the same commit.
+
 It has no runtime dependencies and retries transient GitHub API failures. Always
 pin the action to a full commit SHA.
 
@@ -71,6 +74,12 @@ jobs:
 ```
 
 Require only `gate` in the branch ruleset.
+The `watch` job runs on the default branch tip for `workflow_run` events, so its own check does not gate the pull request head.
+
+Merge the workflow to the default branch before requiring `gate`.
+Until then, only the `pull_request` event reaches it, so no later event can finish its pending verdict.
+For a pull request caught mid-install, let the sibling workflows finish and rerun its PR Gate run once.
+
 
 ## Wait mode
 
@@ -109,6 +118,11 @@ Switching from `check-run` takes two merges. Add `statuses: write` next to
 `checks: write` and set `publish: status`, then drop `checks: write` once that
 has landed. The old `gate` check run can keep a pull request blocked until you
 push a new commit to it.
+
+Changing `publish` on an existing commit leaves both the old and new gate objects behind.
+A pending or failing object can still block the merge after the live verdict passes.
+Push a new commit or conclude the leftover object by hand.
+The workflow on the default branch controls what `workflow_run` events publish, so land that change before switching existing pull requests.
 
 ## How conclusions count
 
@@ -178,6 +192,22 @@ While no check suite has registered on the commit, watch mode keeps polling for 
 `mode` is required and accepts `watch` or `wait`. Inputs and defaults are
 documented in [`action.yml`](action.yml). Durations take `20m`, `2h`, `30s`, plain
 seconds such as `1200`, or ISO 8601 such as `PT20M`.
+
+`skip-events` excludes runs by their original trigger event.
+Its default is `["workflow_dispatch"]`, which excludes manual runs in both modes, including their `workflow_run` notifications.
+Filtering happens before selecting the newest run for each workflow, so manual runs cannot replace an automatic run, satisfy `wait-for`, or extend its timeout.
+Other trigger events and runs with missing event metadata remain eligible.
+With no eligible jobs and no `wait-for` rules, the gate passes, including when every run on the commit is manual.
+Re-running an automatic CI job keeps its original event and still updates the gate.
+GitHub documents the run's [`event` field](https://docs.github.com/en/graphql/reference/actions#workflowrun) and the [`workflow_dispatch` trigger](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_dispatch).
+
+If manual runs are required CI, include them explicitly:
+
+```yaml
+with:
+  mode: watch
+  skip-events: '[]'
+```
 
 `skip-list` ignores a workflow, a job, or matrix job variants. `jobMatchMode`
 accepts `exact` or `prefix`, and omitting `jobName` skips a whole workflow:

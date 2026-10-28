@@ -188,6 +188,7 @@ function inFlightEntry(inFlight) {
     workflowName: inFlight.workflowName || '(unknown workflow)',
     workflowPath: inFlight.workflowPath || '',
     workflowRunId: inFlight.runId,
+    workflowEvent: inFlight.workflowEvent || '',
     // So latestSuitePerWorkflow can rank this against a stale suite left over
     // from an earlier, superseded attempt of the same workflow.
     suiteCreatedAt: new Date(inFlight.startedAtMs).toISOString(),
@@ -241,6 +242,29 @@ function parseRuleList(raw, label) {
 const parseSkipList = (raw) => parseRuleList(raw, 'skip-list');
 const parseWaitFor = (raw) => parseRuleList(raw, 'wait-for');
 
+const DEFAULT_SKIP_EVENTS = ['workflow_dispatch'];
+
+/** An explicit [] includes manual runs for callers that use dispatch as required CI. */
+function parseSkipEvents(raw) {
+  const value = String(raw == null ? '' : raw).trim();
+  if (!value) return [...DEFAULT_SKIP_EVENTS];
+  let events;
+  try {
+    events = JSON.parse(value);
+  } catch (err) {
+    throw new Error(`skip-events is not valid JSON: ${err.message}`);
+  }
+  if (!Array.isArray(events) || events.some((event) => typeof event !== 'string' || !/^[a-z][a-z0-9_]*$/.test(event))) {
+    throw new Error('skip-events must be a JSON array of event names, e.g. ["workflow_dispatch"]');
+  }
+  return events;
+}
+
+/** Missing event metadata stays eligible, so an unreadable trigger cannot hide failed CI. */
+function shouldSkipEvent(entry, skipEvents = DEFAULT_SKIP_EVENTS) {
+  return skipEvents.includes(entry.workflowEvent);
+}
+
 /**
  * Does one rule describe this check run?
  *
@@ -265,7 +289,8 @@ function currentWorkflowFile(env = process.env) {
   return withoutGitRef ? path.basename(withoutGitRef) : '';
 }
 
-function shouldSkip(entry, { currentRunId, currentWorkflowFile: ownFile, skipSameWorkflow, skipList, ownExternalId }) {
+function shouldSkip(entry, { currentRunId, currentWorkflowFile: ownFile, skipSameWorkflow, skipList, skipEvents, ownExternalId }) {
+  if (shouldSkipEvent(entry, skipEvents)) return true;
   // Watch mode publishes its verdict as a check run on the same commit it is
   // inspecting. Without this the gate reads its own previous verdict as a
   // sibling and, once that verdict is a failure, can never recover to success.
@@ -897,6 +922,7 @@ function flattenCheckSuites(suites, onDropped = () => {}) {
         workflowName: suite.workflowRun.workflow?.name || '',
         workflowPath: suite.workflowRun.workflow?.resourcePath || '',
         workflowRunId: suite.workflowRun.databaseId,
+        workflowEvent: String(suite.workflowRun.event || ''),
         // When CI first started on this commit, for the wait-for deadline. Read
         // off the suite rather than the check run because a suite survives
         // re-runs, so every event computes the same deadline.
@@ -923,6 +949,7 @@ const SUITES_QUERY = /* GraphQL */ `
               createdAt
               workflowRun {
                 databaseId
+                event
                 workflow { name resourcePath }
               }
               checkRuns(first: 100) {
@@ -1201,6 +1228,7 @@ function triggeringWorkflowRun(env = process.env) {
     conclusion: String(run.conclusion || '').toLowerCase(),
     workflowName: String(run.name || ''),
     workflowPath: String(run.path || ''),
+    workflowEvent: String(run.event || ''),
   };
 }
 
@@ -1270,6 +1298,7 @@ function withTriggeringRun(entries, run, keep = () => true) {
     workflowName: run.workflowName || '(unknown workflow)',
     workflowPath: run.workflowPath || '',
     workflowRunId: run.runId,
+    workflowEvent: run.workflowEvent || '',
     suiteCreatedAt: new Date(run.startedAtMs).toISOString(),
     status: 'COMPLETED',
     conclusion: run.conclusion || 'failure',
@@ -1765,6 +1794,7 @@ function buildOptions() {
       currentWorkflowFile: currentWorkflowFile(),
       skipSameWorkflow: getBooleanInput('skip-same-workflow'),
       skipList: parseSkipList(getInput('skip-list')),
+      skipEvents: parseSkipEvents(getInput('skip-events')),
       // Only watch mode has a check run of its own to collide with. Kept for
       // `publish: status` too, where this commit can still carry one left behind
       // by an earlier event that ran in check-run mode; counting that as a
@@ -1821,8 +1851,19 @@ function warnUnmatchedSkips(all, skipList) {
   }
 }
 
+/** Names excluded runs once per invocation, including a triggering run whose checks are still invisible. */
+function reportSkippedEvents(all, triggeringRun, skipEvents, seen) {
+  for (const entry of [...all, ...(triggeringRun ? [triggeringRun] : [])]) {
+    if (!shouldSkipEvent(entry, skipEvents)) continue;
+    const id = String(entry.workflowRunId || entry.runId || '');
+    if (seen.has(id)) continue;
+    seen.add(id);
+    notice(`Ignoring workflow run ${id} (${entry.workflowName || '(unknown workflow)'}): skip-events excludes ${entry.workflowEvent}.`);
+  }
+}
+
 /**
- * Reports a `wait-for` rule that names something `skip-list` throws away.
+ * Reports a `wait-for` rule whose only matches are excluded by the skip inputs.
  *
  * The two inputs are opposites, so a rule in both is a configuration mistake with
  * an expensive shape: the gate holds the pull request open for the whole of
@@ -1833,9 +1874,10 @@ function warnConflictingWaitFor(all, skipOpts, waitFor) {
   const skipped = all.filter((entry) => shouldSkip(entry, skipOpts));
   for (const rule of waitFor) {
     if (!skipped.some((entry) => ruleMatches(rule, entry))) continue;
+    if (all.some((entry) => ruleMatches(rule, entry) && !shouldSkip(entry, skipOpts))) continue;
     warn(
-      `wait-for rule ${JSON.stringify(rule)} matches a check run that skip-list ignores, so the gate ` +
-        'can never see it. Remove it from one of the two inputs.'
+      `wait-for rule ${JSON.stringify(rule)} matches a check run that skip-list or skip-events ignores, so the gate ` +
+        'can never see it. Adjust wait-for, skip-list, or skip-events.'
     );
   }
 }
@@ -1881,15 +1923,19 @@ function latestSuitePerWorkflow(entries) {
  * loop and wait mode's poll loop reach the same answer from the same state.
  */
 function assessment(all, { skipOpts, triggeringRun, waitFor, waitForTimeoutSec, timeoutConclusion, earlyExit }, nowMs = Date.now()) {
+  // Exclude manual runs before projecting event state or choosing the newest run.
+  const eligible = all.filter((entry) => !shouldSkipEvent(entry, skipOpts.skipEvents));
+  const eligibleTrigger = triggeringRun && !shouldSkipEvent(triggeringRun, skipOpts.skipEvents)
+    ? triggeringRun : null;
   // A projected entry goes through skip-list like any other. Waiting on a run the
   // caller explicitly told the gate to ignore would be a worse bug than the one
   // the projection fixes.
   const watched = latestSuitePerWorkflow(withTriggeringRun(
-    all.filter((entry) => !shouldSkip(entry, skipOpts)),
-    triggeringRun,
+    eligible.filter((entry) => !shouldSkip(entry, skipOpts)),
+    eligibleTrigger,
     (entry) => !shouldSkip(entry, skipOpts)
   ));
-  const deadlineMs = waitForDeadlineMs(all, waitForTimeoutSec);
+  const deadlineMs = waitForDeadlineMs(eligible, waitForTimeoutSec);
   const { entries: expected, waived } = waitForEntries(watched, waitFor, {
     deadlineMs,
     nowMs,
@@ -1935,7 +1981,7 @@ async function runWatch(opts) {
   log(`  event: ${process.env.GITHUB_EVENT_NAME || '(unknown)'}, api retries: ${ctx.retryLimit}`);
   if (skipOpts.skipList.length > 0) log(`  skip-list: ${JSON.stringify(skipOpts.skipList)}`);
   if (waitFor.length > 0) log(`  wait-for: ${JSON.stringify(waitFor)}, timeout ${waitForTimeoutSec}s`);
-  if (triggeringRun && !triggeringRun.finished) {
+  if (triggeringRun && !triggeringRun.finished && !shouldSkipEvent(triggeringRun, skipOpts.skipEvents)) {
     notice(
       `Woken by workflow run ${triggeringRun.runId} (attempt ${triggeringRun.attempt}) starting. Until its check ` +
         'runs are visible the gate reports it as unfinished, so an event announcing that work began cannot ' +
@@ -2008,6 +2054,8 @@ async function recomputeAndPublish(opts, publisher, reportDropped, onPublished) 
   }
 
   let state = await assess();
+  const reportedSkips = new Set();
+  reportSkippedEvents(state.all, opts.triggeringRun, skipOpts.skipEvents, reportedSkips);
   if (state.watched.length === 0 && !seedEvent && warmupMs > 0) {
     // Nothing visible on a completion event should be impossible, since the
     // workflow that triggered it is itself a check run on this commit. Warm up
@@ -2015,6 +2063,7 @@ async function recomputeAndPublish(opts, publisher, reportDropped, onPublished) 
     warn(`No watched check runs visible on a ${process.env.GITHUB_EVENT_NAME} event. Retrying after ${Math.round(warmupMs / 1000)}s.`);
     await sleep(warmupMs);
     state = await assess();
+    reportSkippedEvents(state.all, opts.triggeringRun, skipOpts.skipEvents, reportedSkips);
   }
 
   log(`${state.watched.length} watched check run(s) of ${state.all.length} total.`);
@@ -2060,6 +2109,7 @@ async function recomputeAndPublish(opts, publisher, reportDropped, onPublished) 
       await sleep(Math.max(1000, Math.min(minimumMs, remainingMs)));
       polls += 1;
       state = await assess();
+      reportSkippedEvents(state.all, opts.triggeringRun, skipOpts.skipEvents, reportedSkips);
       log(state.deadlineMs == null
         ? `Poll ${polls}: no check suite has registered yet, so wait-for-timeout has not started.`
         : `Poll ${polls}: ${Math.round(Math.max(0, state.deadlineMs - Date.now()) / 1000)}s left on wait-for-timeout.`);
@@ -2144,6 +2194,7 @@ async function runWait(opts) {
   let polls = 0;
   let warnedUnmatchedSkips = false;
   const announcedWaivers = new Set();
+  const reportedSkips = new Set();
   for (let attempt = 1; attempt <= attemptLimits; attempt += 1) {
     polls = attempt;
     const waitMs = attempt === 1 ? warmupMs : pollIntervalMs(retryMethod, minimumMs, attempt);
@@ -2156,6 +2207,7 @@ async function runWait(opts) {
     const { all, watched, entries, waived, result } = assessment(
       flattenCheckSuites(suites, reportDropped), opts
     );
+    reportSkippedEvents(all, opts.triggeringRun, skipOpts.skipEvents, reportedSkips);
 
     log(`Poll ${attempt}: ${watched.length} watched check run(s) of ${all.length} total.`);
     for (const entry of entries) log(`  ${formatEntry(entry)}`);
@@ -2248,6 +2300,7 @@ module.exports = {
   parseMode,
   parsePublish,
   parseSkipList,
+  parseSkipEvents,
   parseWaitFor,
   parseTimeoutConclusion,
   ruleMatches,

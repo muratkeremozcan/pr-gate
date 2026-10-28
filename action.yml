@@ -35,7 +35,11 @@ description: |
   non-Actions GitHub Apps (Vercel, GitGuardian) are not judged, and the verdict
   summary names them.
 
-  Copy-paste workflows for both modes are in pr-gate/README.md. They are not
+  Manual workflow_dispatch runs are excluded by default. They cannot change the
+  verdict for automatic CI on the same commit. Configure skip-events to include
+  manual runs when they are required CI.
+
+  Copy-paste workflows for both modes are in README.md. They are not
   repeated here, because Actions evaluates expression syntax anywhere in this file
   including inside a description, and the watch-mode example needs an expression
   for its concurrency group.
@@ -57,6 +61,14 @@ inputs:
       finished and a wait-for rule has not matched anything yet. A job that has
       not started fires no events, so leaving at that point would park the gate
       pending forever and never reach wait-for-timeout.
+
+      Watch mode reads the commit once per event and exits, so it depends on
+      workflow_run to converge, and GitHub delivers workflow_run only to the copy
+      of a workflow that is already on the default branch. A pull request that adds
+      or edits the calling workflow therefore receives only its pull_request event,
+      publishes a pending verdict, and gets nothing later that could finish it. See
+      "Watch mode" in README.md for the ordering that avoids this and the one-time
+      rerun that resolves it.
     required: true
   check-name:
     description: |
@@ -91,6 +103,22 @@ inputs:
       140 characters, so the markdown goes to the job summary and target_url
       links to it. Each normal event writes two status rows. GitHub accepts 1000
       rows per commit and context.
+
+      Changing this value on an in-flight pull request leaves the previous verdict
+      on the commit, and both claim the same required context. GitHub's rollup
+      takes the worse of the two, so a leftover pending or failing object blocks a
+      merge the live verdict has already passed. Towards 'status' the leftover is a
+      check run and the action warns about it; back towards 'check-run' the
+      leftover is a status and there is no warning, because reading statuses would
+      need `statuses: read` from every caller. Push a new commit or overwrite the
+      leftover by hand.
+
+      This value is only ever read from the workflow file GitHub loads for the
+      event, which for workflow_run is the default branch's copy. Setting it on a
+      pull request branch therefore does not change what the workflow_run events
+      for that same commit publish: they keep using the old publisher until the
+      change is on the default branch, which is how one commit ends up carrying two
+      objects of the same required name.
     required: false
     default: 'check-run'
   github-token:
@@ -151,6 +179,17 @@ inputs:
       jobMatchMode is "exact" (default) or "prefix". Omit jobName to skip a whole workflow file.
     required: false
     default: '[]'
+  skip-events:
+    description: |
+      JSON array of workflow trigger events to exclude. Defaults to
+      ["workflow_dispatch"], so manual runs against other environments cannot
+      fail the PR gate, replace automatic CI, or satisfy a wait-for rule.
+
+      Uses each workflow run's original event, including when the gate itself
+      was triggered by workflow_run. Other events remain eligible. Missing event
+      metadata remains eligible. Set [] to include manual runs as required CI.
+    required: false
+    default: '["workflow_dispatch"]'
   bypass-branch-prefixes:
     description: |
       Comma separated branch prefixes that wave the gate through, e.g.
